@@ -2,5 +2,4 @@ runtime/
 logs/
 __pycache__/
 *.pyc
-TSCtl.sys
 _task.xml

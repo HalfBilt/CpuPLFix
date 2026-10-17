@@ -40,8 +40,9 @@ CPU 就被钉在最低频。
 ## 用法
 
 1. 下载本仓库（`Code` → `Download ZIP`），解压到任意目录
-2. 准备 ThrottleStop：下载 <https://www.techpowerup.com/download/techpowerup-throttlestop/>
-3. 双击 `1-install.bat`，UAC 弹窗点"是"
+2. 双击 `1-install.bat`，UAC 弹窗点"是"
+
+**不需要安装 ThrottleStop**，驱动已经内置在包里。
 
 其它脚本：
 
@@ -57,18 +58,22 @@ CPU 就被钉在最低频。
 
 ## 关于驱动
 
-读写 MSR 和物理内存必须有内核驱动。**本仓库不附带任何驱动文件。**
+读写 MSR 和物理内存必须有内核驱动。本工具**已内置** `TSCtl.sys`，安装时复制到工具目录
+并注册成服务 `TSCtl`，之后由计划任务按需拉起。
 
-安装时工具会从你机器上已安装的 `ThrottleStop.exe` 里提取它自带的那个驱动
-（ThrottleStop 把驱动作为资源内嵌在 exe 里，作者签名完整，提取过程不改一个字节），
-存成本目录下的 `TSCtl.sys` 并注册成服务 `TSCtl`。
+这个驱动来自 ThrottleStop（作者 Kevin Glynn）——ThrottleStop 把它作为资源内嵌在自己的
+exe 里，本工具按 PE 结构把 x64 镜像连同 Authenticode 签名一起提取出来，一个字节都没改，
+只换了个文件名（否则会和 ThrottleStop 自己的设备名冲突）。选它是因为它是少数既能通过
+现代 Windows 驱动签名校验、又同时提供 MSR / 物理内存 / PCI 配置访问的现成驱动。
 
-所以请先把 `ThrottleStop.exe` 放到本目录，或者装在桌面 / 下载 / Program Files 下 ——
-工具会自动去找。找不到会给出提示。
+> **装好本工具后可以直接卸载 ThrottleStop**，两者互不影响。驱动文件在
+> `C:\CpuPLFix\TSCtl.sys`，服务名 `TSCtl`，跟 ThrottleStop 的临时驱动没有任何关联。
 
-顺带一提，驱动内嵌的位置和提取方式见 `CpuPLFix.py` 里的 `_extract_driver_from_exe()`：
-按 PE 结构扫描 `MZ`/`PE\0\0` 头，取 `machine == 0x8664` 的镜像，再按 Security 目录
-把 Authenticode 签名一起带出来（少一个字节签名就失效，驱动就加载不了）。
+已知限制：如果机器开了 **内核隔离 / 内存完整性（HVCI）**，Windows 可能拒绝加载这类
+直接访问物理内存的驱动，安装会失败。需要先关掉内存完整性再装。
+
+`CpuPLFix.py` 里另外保留了 `_extract_driver_from_exe()` 作为兜底：万一 `TSCtl.sys`
+丢了，而本机恰好有 `ThrottleStop.exe`，工具会自动从里面重新提取一份。
 
 ---
 
@@ -135,4 +140,8 @@ CPU 自身的热保护（温度墙、EDP 电流墙）完全不受影响，该降
 
 ## License
 
-代码 MIT。不包含任何第三方驱动或 ThrottleStop 的二进制文件。
+本仓库代码 MIT。
+
+`TSCtl.sys` 是从 ThrottleStop（Kevin Glynn）中提取的原版驱动，版权归其作者所有，
+此处仅为方便用户直接使用而附带。ThrottleStop 是免费软件，如果你要再分发，请自行确认授权；
+不想附带的话，删掉 `TSCtl.sys` 即可——工具会尝试从本机已安装的 ThrottleStop.exe 重新提取。
