@@ -5,5 +5,5 @@
   "pl2_time": 66,
   "min_pl1_w": 15.0,
   "lock_mmio": true,
-  "comment": "pl1_w/pl2_w = 0 表示自动(镜像 MSR 的值, MSR 也坏掉时退回 CPU 标称 TDP)。想固定功耗墙就填具体瓦数。"
+  "comment": "pl1_w/pl2_w = 写进 MMIO 的功耗墙(瓦)。填 0 表示自动(镜像 MSR 的值, MSR 也坏掉时退回 CPU 标称 TDP)；填具体数字就是精确目标值, 调高调低都生效(安全下限 5W)。只填 pl1_w 不填 pl2_w 时, PL2 取 max(MSR 的 PL2, PL1 x 1.25)。min_pl1_w 是判定 MSR 是否异常的阈值(只影响自动模式)。改完必须重启才生效, 因为锁定位在本个开机电周期内不可逆。"
 }

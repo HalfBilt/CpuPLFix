@@ -36,7 +36,10 @@ LOG_DIR = os.path.join(BASE, 'logs')
 SYS_SRC = os.path.join(BASE, 'TSCtl.sys')
 SYS_DST = os.path.join(BASE, 'TSCtl.sys')
 SVC = 'TSCtl'
+SVC_TOOL = 'CpuPLFixSvc'
 TASK_NAME = 'CpuPLFix'
+BOOT_WATCH_SEC = 240         # 开机/唤醒后看守多久(秒)
+MIN_PL_W = 5.0               # 手动指定功耗墙时的安全下限, 低于它机器会慢到没法用
 
 MCHBAR_REG = 0x48
 MMIO_PL_OFF = 0x59A0
@@ -68,6 +71,18 @@ k32.DeviceIoControl.restype = w.BOOL
 k32.DeviceIoControl.argtypes = [w.HANDLE, w.DWORD, w.LPVOID, w.DWORD, w.LPVOID, w.DWORD,
                                 ctypes.POINTER(w.DWORD), w.LPVOID]
 k32.GetConsoleWindow.restype = w.HWND
+k32.GetTickCount64.restype = ctypes.c_ulonglong
+
+_T_IMPORT = time.time()          # 解释器启动到能执行到这里的时间
+
+
+def uptime():
+    """系统已运行秒数(用于判断任务到底有多晚才被触发)"""
+    try:
+        return k32.GetTickCount64() / 1000.0
+    except Exception:
+        return -1.0
+
 
 _lines = []
 
@@ -82,12 +97,16 @@ def out(msg=''):
 
 
 def flush_log(tag='run'):
+    """把当前缓冲写盘并清空 —— 这样看守期间也能随时看到已发生的事"""
+    if not _lines:
+        return
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
         p = os.path.join(LOG_DIR, 'fix.log')
         with open(p, 'a', encoding='utf-8') as f:
             f.write('\n===== %s %s =====\n' % (datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), tag))
             f.write('\n'.join(_lines) + '\n')
+        del _lines[:]
     except Exception:
         pass
 
@@ -209,6 +228,135 @@ def _sc(*args):
         return -1, str(e)
 
 
+def _binpath():
+    """sc.exe 的 binPath 参数: 路径带空格时必须整体加引号"""
+    return '"%s"' % SYS_DST if ' ' in SYS_DST else SYS_DST
+
+
+# ---- 直接走 SCM API, 不 spawn sc.exe -------------------------------------
+# 0.4GHz 下 spawn 一个进程要好几秒, 开机抢时间时这一步的代价很大。
+adv = ctypes.WinDLL('advapi32', use_last_error=True)
+adv.OpenSCManagerW.restype = w.HANDLE
+adv.OpenSCManagerW.argtypes = [w.LPCWSTR, w.LPCWSTR, w.DWORD]
+adv.OpenServiceW.restype = w.HANDLE
+adv.OpenServiceW.argtypes = [w.HANDLE, w.LPCWSTR, w.DWORD]
+adv.StartServiceW.argtypes = [w.HANDLE, w.DWORD, ctypes.POINTER(w.LPCWSTR)]
+adv.QueryServiceStatus.argtypes = [w.HANDLE, ctypes.c_void_p]
+adv.CloseServiceHandle.argtypes = [w.HANDLE]
+
+SC_MANAGER_CONNECT = 0x0001
+SC_MANAGER_CREATE_SERVICE = 0x0002
+SERVICE_QUERY_STATUS = 0x0004
+SERVICE_START = 0x0010
+SERVICE_STOP = 0x0020
+SERVICE_RUNNING = 4
+SERVICE_ALL_ACCESS = 0xF01FF
+DELETE = 0x00010000
+SERVICE_KERNEL_DRIVER = 0x00000001
+SERVICE_WIN32_OWN_PROCESS = 0x00000010
+SERVICE_AUTO_START = 0x00000002
+SERVICE_DEMAND_START = 0x00000003
+SERVICE_ERROR_IGNORE = 0x00000000
+SERVICE_ERROR_NORMAL = 0x00000001
+SERVICE_CONTROL_STOP = 0x00000001
+
+adv.CreateServiceW.restype = w.HANDLE
+adv.CreateServiceW.argtypes = [w.HANDLE, w.LPCWSTR, w.LPCWSTR, w.DWORD, w.DWORD, w.DWORD,
+                               w.DWORD, w.LPCWSTR, w.LPCWSTR, ctypes.c_void_p,
+                               w.LPCWSTR, w.LPCWSTR, w.LPCWSTR]
+adv.DeleteService.argtypes = [w.HANDLE]
+adv.ControlService.argtypes = [w.HANDLE, w.DWORD, ctypes.c_void_p]
+
+
+def svc_create(name, binpath, display, svc_type, start_type, error_control):
+    """创建服务(内核驱动或用户态服务通用)。返回 (成功, 错误信息)"""
+    hscm = adv.OpenSCManagerW(None, None, SC_MANAGER_CREATE_SERVICE | SC_MANAGER_CONNECT)
+    if not hscm:
+        return False, 'OpenSCManager 失败 %d' % ctypes.get_last_error()
+    try:
+        hs = adv.CreateServiceW(hscm, name, display or name, SERVICE_ALL_ACCESS,
+                                svc_type, start_type, error_control,
+                                binpath, None, None, None, None, None)
+        if not hs:
+            err = ctypes.get_last_error()
+            if err == 1073:                      # 已存在
+                hs = adv.OpenServiceW(hscm, name, DELETE | SERVICE_START | SERVICE_QUERY_STATUS)
+                if hs:
+                    adv.DeleteService(hs)
+                    adv.CloseServiceHandle(hs)
+                    time.sleep(0.4)
+                    hs = adv.CreateServiceW(hscm, name, display or name, SERVICE_ALL_ACCESS,
+                                            svc_type, start_type, error_control,
+                                            binpath, None, None, None, None, None)
+            if not hs:
+                return False, 'CreateService 失败 %d' % ctypes.get_last_error()
+        adv.CloseServiceHandle(hs)
+        return True, ''
+    finally:
+        adv.CloseServiceHandle(hscm)
+
+
+def svc_delete(name):
+    hscm = adv.OpenSCManagerW(None, None, SC_MANAGER_CONNECT)
+    if not hscm:
+        return False
+    try:
+        hs = adv.OpenServiceW(hscm, name, DELETE | SERVICE_STOP | SERVICE_QUERY_STATUS)
+        if not hs:
+            return False
+        try:
+            buf = ctypes.create_string_buffer(28)
+            if adv.QueryServiceStatus(hs, ctypes.byref(buf)):
+                if ctypes.cast(buf, ctypes.POINTER(w.DWORD))[1] != 1:      # 非 STOPPED
+                    adv.ControlService(hs, SERVICE_CONTROL_STOP, ctypes.byref(buf))
+                    time.sleep(0.5)
+            return bool(adv.DeleteService(hs))
+        finally:
+            adv.CloseServiceHandle(hs)
+    finally:
+        adv.CloseServiceHandle(hscm)
+
+
+def svc_state(name):
+    """返回 (服务是否存在, 是否已运行)。不 spawn 任何进程。"""
+    hscm = adv.OpenSCManagerW(None, None, SC_MANAGER_CONNECT)
+    if not hscm:
+        return None, None
+    try:
+        hs = adv.OpenServiceW(hscm, name, SERVICE_QUERY_STATUS | SERVICE_START)
+        if not hs:
+            return False, False
+        try:
+            buf = ctypes.create_string_buffer(28)      # SERVICE_STATUS
+            ok = adv.QueryServiceStatus(hs, ctypes.byref(buf))
+            if not ok:
+                return True, False
+            state = ctypes.cast(buf, ctypes.POINTER(w.DWORD))[1]
+            return True, state == SERVICE_RUNNING
+        finally:
+            adv.CloseServiceHandle(hs)
+    finally:
+        adv.CloseServiceHandle(hscm)
+
+
+def svc_start(name):
+    hscm = adv.OpenSCManagerW(None, None, SC_MANAGER_CONNECT)
+    if not hscm:
+        return False
+    try:
+        hs = adv.OpenServiceW(hscm, name, SERVICE_START | SERVICE_QUERY_STATUS)
+        if not hs:
+            return False
+        try:
+            if adv.StartServiceW(hs, 0, None):
+                return True
+            return ctypes.get_last_error() == 1056     # 已在运行
+        finally:
+            adv.CloseServiceHandle(hs)
+    finally:
+        adv.CloseServiceHandle(hscm)
+
+
 def ensure_driver(verbose=True):
     """确保驱动服务已加载, 返回设备句柄"""
     global _handle
@@ -220,20 +368,22 @@ def ensure_driver(verbose=True):
         _handle = h
         return h
 
-    rc, txt = _sc('query', SVC)
-    if '1060' in txt:                      # 服务不存在 -> 创建
+    exists, _running = svc_state(SVC)
+    if exists is False:                 # 服务不存在 -> 创建
         if not ensure_driver_file():
             return None
-        rc, txt = _sc('create', SVC, 'type=', 'kernel', 'start=', 'demand',
-                      'error=', 'ignore', 'binPath=', SYS_DST)
+        ok, msg = svc_create(SVC, '\\??\\' + SYS_DST, 'TSCtl', SERVICE_KERNEL_DRIVER,
+                             SERVICE_DEMAND_START, SERVICE_ERROR_IGNORE)
+        if not ok:                      # API 不行再退回 sc.exe
+            rc, txt = _sc('create', SVC, 'type=', 'kernel', 'start=', 'demand',
+                          'error=', 'ignore', 'binPath=', _binpath())
+            ok, msg = (rc == 0), txt.strip()[:120]
         if verbose:
-            out('[*] 创建驱动服务: %s' % ('成功' if rc == 0 else txt.strip()))
+            out('[*] 创建驱动服务: %s' % ('成功' if ok else msg))
 
-    rc, txt = _sc('start', SVC)
-    if verbose and rc != 0 and '1056' not in txt and 'RUNNING' not in txt:
-        out('[*] 启动驱动服务: %s' % txt.strip()[:160])
+    svc_start(SVC)
 
-    for _ in range(20):                 # 开机早期可能还没准备好, 最多等 10 秒
+    for _ in range(40):                 # 开机早期可能还没准备好, 最多等 20 秒
         h = _open_dev()
         if h:
             _handle = h
@@ -243,10 +393,15 @@ def ensure_driver(verbose=True):
 
 
 def ioctl(code, inbuf, outlen):
+    global _handle
     o = ctypes.create_string_buffer(max(outlen, 1))
     ret = w.DWORD(0)
     ib = ctypes.create_string_buffer(inbuf if inbuf else b'\x00', max(len(inbuf), 1))
     ok = k32.DeviceIoControl(_handle, code, ib, len(inbuf), o, outlen, ctypes.byref(ret), None)
+    if not ok:
+        # 句柄可能已失效(驱动被卸载 / 设备被移除 / 睡眠后重载) —— 清掉缓存,
+        # 下一次 ensure_driver() 会自动重新 CreateFile, 而不是一直拿着死句柄重试。
+        _handle = None
     return bool(ok), o.raw
 
 
@@ -362,6 +517,28 @@ def cmd_check():
     return 0
 
 
+def _target_pl(cfg, d_m):
+    """算出应该写进 MMIO 的目标功耗墙。cmd_fix / cmd_boot 共用同一套规则。"""
+    c1, c2 = float(cfg['pl1_w'] or 0), float(cfg['pl2_w'] or 0)
+    if c1 > 0:                              # 用户明确指定 -> 精确目标值
+        pl1 = max(c1, MIN_PL_W)
+        if pl1 != c1:
+            out('[!] pl1_w=%.1fW 低于安全下限 %.1fW, 已按下限处理' % (c1, MIN_PL_W))
+        pl2 = c2 if c2 > 0 else max(d_m['pl2_w'], pl1 * 1.25)
+        if pl2 < pl1:
+            out('[!] pl2_w=%.1fW 小于 pl1_w=%.1fW, 已按 PL1 处理' % (pl2, pl1))
+            pl2 = pl1
+        return pl1, pl2
+    if d_m['pl1_w'] >= cfg['min_pl1_w']:    # 自动: 镜像 MSR
+        return d_m['pl1_w'], d_m['pl2_w']
+    tdp = rated_tdp()
+    pl1 = tdp or 25.0
+    pl2 = round(tdp * 1.25, 2) if tdp else round(pl1 * 1.25, 2)
+    out('[*] MSR 里的 PL1 只有 %.2fW, 判定为异常; 兜底取 CPU 标称 TDP: PL1=%.2fW PL2=%.2fW'
+        % (d_m['pl1_w'], pl1, pl2))
+    return pl1, pl2
+
+
 def cmd_fix(quiet=False):
     cfg = load_cfg()
     if not ensure_driver(verbose=not quiet):
@@ -382,32 +559,19 @@ def cmd_fix(quiet=False):
     d_o = decode_pl(mmio_before) if mmio_before is not None else None
 
     # 目标功耗墙
-    #   config 里写了具体瓦数(>0) -> 作为下限, 保证不低于它(用户明确指定)
-    #   config 为 0(自动)        -> 镜像 MSR 的值; 若 MSR 本身也坏掉了, 退回到 CPU 标称 TDP
-    tdp = rated_tdp()
-    c1, c2 = float(cfg['pl1_w'] or 0), float(cfg['pl2_w'] or 0)
-    if c1 > 0:
-        pl1 = max(d_m['pl1_w'], c1)
-        pl2 = max(d_m['pl2_w'], c2) if c2 > 0 else max(d_m['pl2_w'], pl1 * 1.25)
-    else:
-        if d_m['pl1_w'] >= cfg['min_pl1_w']:
-            pl1, pl2 = d_m['pl1_w'], d_m['pl2_w']
-        else:
-            pl1 = tdp or 25.0
-            pl2 = round(tdp * 1.25, 2) if tdp else round(pl1 * 1.25, 2)
-            if not quiet:
-                out('[*] MSR 里的 PL1 只有 %.2fW, 判定为异常; 兜底取 CPU 标称 TDP: PL1=%.2fW PL2=%.2fW'
-                    % (d_m['pl1_w'], pl1, pl2))
+    pl1, pl2 = _target_pl(cfg, d_m)
     t1 = d_m['pl1_t'] or int(cfg['pl1_time'])
     t2 = d_m['pl2_t'] or int(cfg['pl2_time'])
 
     target = build_pl(pl1, pl2, t1, t2, bool(cfg.get('lock_mmio', True)))
 
-    if not quiet:
-        out('修复前: MSR PL1=%.2fW PL2=%.2fW | MMIO PL1=%.2fW PL2=%.2fW lock=%s'
-            % (d_m['pl1_w'], d_m['pl2_w'],
-               d_o['pl1_w'] if d_o else -1, d_o['pl2_w'] if d_o else -1,
-               d_o['lock'] if d_o else '?'))
+    out('修复前: MSR 0x610=0x%016X PL1=%.2fW PL2=%.2fW | MMIO +0x59A0=0x%016X PL1=%.2fW PL2=%.2fW lock=%s'
+        % (msr, d_m['pl1_w'], d_m['pl2_w'],
+           mmio_before if mmio_before is not None else 0,
+           d_o['pl1_w'] if d_o else -1, d_o['pl2_w'] if d_o else -1,
+           d_o['lock'] if d_o else '?'))
+    out('目标    : PL1=%.2fW PL2=%.2fW (%.0f秒/%.0f秒)%s'
+        % (pl1, pl2, t1, t2, ', 锁定' if cfg.get('lock_mmio', True) else ', 不锁定'))
 
     ok = False
     for attempt in range(3):
@@ -425,9 +589,12 @@ def cmd_fix(quiet=False):
 
     back = rdphys(mmio_addr, 8)
     d_b = decode_pl(back) if back is not None else None
+    lock_ok = False
     if d_b:
-        out('修复后: MMIO PL1=%.2fW PL2=%.2fW lock=%s  %s'
-            % (d_b['pl1_w'], d_b['pl2_w'], d_b['lock'], '[√] 已生效' if ok else '[X] 写入未生效'))
+        lock_ok = (not cfg.get('lock_mmio', True)) or (d_b['lock'] == 1)
+        out('修复后: MMIO 0x%016X PL1=%.2fW PL2=%.2fW lock=%d  %s'
+            % (back, d_b['pl1_w'], d_b['pl2_w'], d_b['lock'],
+               '[√] 已生效并锁定' if (ok and lock_ok) else '[X] 未生效'))
     else:
         out('[X] 回读失败')
 
@@ -435,7 +602,7 @@ def cmd_fix(quiet=False):
     time.sleep(0.6)
     r0 = (rdmsr(MSR_PERF_STATUS) or 0) >> 8 & 0xFF
     out('当前倍频: %d (约 %.2f GHz)' % (r0, r0 / 10.0))
-    return 0 if ok else 1
+    return 0 if (ok and lock_ok) else 1
 
 
 def cmd_save():
@@ -463,12 +630,26 @@ TASK_XML = """<?xml version="1.0" encoding="UTF-16"?>
   <Triggers>
     <BootTrigger>
       <Enabled>true</Enabled>
-      <Delay>PT15S</Delay>
+      <Delay>PT1S</Delay>
+      <Repetition>
+        <Interval>PT5M</Interval>
+        <Duration>PT30M</Duration>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
     </BootTrigger>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT3S</Delay>
+    </LogonTrigger>
     <EventTrigger>
       <Enabled>true</Enabled>
       <Subscription>&lt;QueryList&gt;&lt;Query Id="0" Path="System"&gt;&lt;Select Path="System"&gt;*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] and EventID=1]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
-      <Delay>PT4S</Delay>
+      <Delay>PT3S</Delay>
+    </EventTrigger>
+    <EventTrigger>
+      <Enabled>true</Enabled>
+      <Subscription>&lt;QueryList&gt;&lt;Query Id="0" Path="System"&gt;&lt;Select Path="System"&gt;*[System[Provider[@Name='Microsoft-Windows-Kernel-Power'] and EventID=107]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
+      <Delay>PT3S</Delay>
     </EventTrigger>
   </Triggers>
   <Principals>
@@ -493,18 +674,76 @@ TASK_XML = """<?xml version="1.0" encoding="UTF-16"?>
     <Hidden>false</Hidden>
     <RunOnlyIfIdle>false</RunOnlyIfIdle>
     <WakeToRun>false</WakeToRun>
-    <ExecutionTimeLimit>PT5M</ExecutionTimeLimit>
-    <Priority>7</Priority>
+    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>
+    <Priority>0</Priority>
   </Settings>
   <Actions Context="Author">
     <Exec>
       <Command>%(exe)s</Command>
-      <Arguments>"%(script)s" fix</Arguments>
+      <Arguments>"%(script)s" boot</Arguments>
       <WorkingDirectory>%(dir)s</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>
 """
+
+
+def _pyw():
+    """优先用 pythonw.exe(无控制台窗口)"""
+    exe = sys.executable
+    pw = os.path.join(os.path.dirname(exe), 'pythonw.exe')
+    return pw if os.path.exists(pw) else exe
+
+
+def _quote_if_space(p):
+    return '"%s"' % p if ' ' in p else p
+
+
+def _create_tool_svc(binpath):
+    ok, msg = svc_create(SVC_TOOL, binpath, 'CpuPLFix 功耗墙看守',
+                         SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL)
+    if not ok:
+        rc, txt = _sc('create', SVC_TOOL, 'type=', 'own', 'start=', 'auto',
+                      'error=', 'normal', 'DisplayName=', 'CpuPLFix 功耗墙看守',
+                      'binPath=', binpath)
+        if rc != 0:
+            return False, msg or txt.strip()[:200]
+    return True, ''
+
+
+def _install_tool_service():
+    """把 CpuPLFixSvc 注册成自动启动的 Windows 服务"""
+    script = os.path.join(BASE, 'CpuPLFixSvc.py')
+    if not os.path.exists(script):
+        return False, '找不到 CpuPLFixSvc.py'
+    binpath = '"%s" "%s" --service' % (_pyw(), script)
+
+    exists, _running = svc_state(SVC_TOOL)
+    if exists:
+        # 必须先停再删: DeleteService 对运行中的服务只是"标记删除",
+        # 紧接着 CreateService 会报 1072(服务已标记为删除)。
+        svc_delete(SVC_TOOL)
+        for _ in range(24):                 # 最多等 12 秒, 等旧服务真正消失
+            if not svc_state(SVC_TOOL)[0]:
+                break
+            time.sleep(0.5)
+
+    ok, msg = _create_tool_svc(binpath)
+    for _ in range(10):                     # 还在标记删除状态就再等等重试
+        if ok:
+            break
+        time.sleep(1.0)
+        ok, msg = _create_tool_svc(binpath)
+
+    if not ok:
+        return False, msg
+    if svc_start(SVC_TOOL):
+        return True, ''
+    return True, '已注册, 但立即启动失败(下次开机仍会自启)'
+
+
+def _remove_tool_service():
+    return svc_delete(SVC_TOOL)
 
 
 def cmd_install():
@@ -515,39 +754,50 @@ def cmd_install():
     if not ensure_driver_file():
         return 1
 
-    # 1. 驱动服务
-    _sc('stop', SVC)
-    _sc('delete', SVC)
-    time.sleep(0.4)
-    rc, txt = _sc('create', SVC, 'type=', 'kernel', 'start=', 'demand',
-                  'error=', 'ignore', 'binPath=', SYS_DST)
-    out('[1/3] 驱动服务: %s' % ('创建成功' if rc == 0 else txt.strip()[:120]))
+    # 1. 驱动服务(已存在且可用就不动它, 避免把能用的环境搞坏)
+    exists, running = svc_state(SVC)
+    if exists and (running or _open_dev()):
+        out('[1/4] 驱动服务: 已存在且可用, 跳过重建')
+    else:
+        ok, msg = svc_create(SVC, '\\??\\' + SYS_DST, 'TSCtl', SERVICE_KERNEL_DRIVER,
+                             SERVICE_DEMAND_START, SERVICE_ERROR_IGNORE)
+        if not ok:
+            rc, txt = _sc('create', SVC, 'type=', 'kernel', 'start=', 'demand',
+                          'error=', 'ignore', 'binPath=', _binpath())
+            ok, msg = (rc == 0), txt.strip()[:120]
+        out('[1/4] 驱动服务: %s' % ('创建成功' if ok else msg))
+        svc_start(SVC)
 
-    # 2. 计划任务
-    exe = sys.executable
-    pw = os.path.join(os.path.dirname(exe), 'pythonw.exe')
-    if os.path.exists(pw):
-        exe = pw
-    xml = TASK_XML % {'exe': exe, 'script': os.path.abspath(__file__), 'dir': BASE}
-    tmp = os.path.join(BASE, '_task.xml')
-    with open(tmp, 'w', encoding='utf-16') as f:
-        f.write(xml)
-    p = subprocess.run(['C:\\Windows\\System32\\schtasks.exe', '/create', '/tn', TASK_NAME,
-                        '/xml', tmp, '/f'], capture_output=True, text=True, errors='replace',
-                       creationflags=0x08000000)
-    ok = p.returncode == 0
-    out('[2/3] 计划任务: %s' % ('已创建(开机 + 唤醒时自动运行)' if ok
-                              else (p.stdout + p.stderr).strip()[:200]))
+    # 2. 常驻看守服务(随系统启动, 不依赖登录)
+    ok2, msg2 = _install_tool_service()
+    out('[2/4] 看守服务: %s' % ('已注册并启动(随系统启动, 常驻监视)'
+                               if ok2 and not msg2 else (msg2 or '注册失败')))
+
+    # 3. 计划任务(兜底: 万一服务没起来)
     try:
-        os.remove(tmp)
-    except Exception:
-        pass
+        exe = _pyw()
+        xml = TASK_XML % {'exe': exe, 'script': os.path.abspath(__file__), 'dir': BASE}
+        tmp = os.path.join(BASE, '_task.xml')
+        with open(tmp, 'w', encoding='utf-16') as f:
+            f.write(xml)
+        p = subprocess.run(['C:\\Windows\\System32\\schtasks.exe', '/create', '/tn', TASK_NAME,
+                            '/xml', tmp, '/f'], capture_output=True, text=True, errors='replace',
+                           creationflags=0x08000000)
+        ok = p.returncode == 0
+        out('[3/4] 计划任务: %s' % ('已创建(开机/登录/唤醒兜底)' if ok
+                                  else (p.stdout + p.stderr).strip()[:200]))
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+    except Exception as e:
+        out('[3/4] 计划任务: 跳过 (%s)' % e)
 
-    # 3. 立即执行一次
-    out('[3/3] 立即应用一次:')
+    # 4. 立即执行一次
+    out('[4/4] 立即应用一次:')
     rc = cmd_fix(quiet=False)
     out('')
-    out('安装完成。以后开机和睡眠唤醒后会自动修复, 日志在 %s' % LOG_DIR)
+    out('安装完成。开机、登录、睡眠唤醒、休眠恢复都会自动修复, 日志在 %s' % LOG_DIR)
     return rc
 
 
@@ -555,12 +805,110 @@ def cmd_uninstall():
     if not is_admin():
         out('[!] 需要管理员权限, 正在请求提权...')
         return 0 if elevate() else 1
-    p = subprocess.run(['C:\\Windows\\System32\\schtasks.exe', '/delete', '/tn', TASK_NAME, '/f'],
-                       capture_output=True, text=True, errors='replace', creationflags=0x08000000)
-    out('[1/2] 计划任务: %s' % ('已删除' if p.returncode == 0 else '不存在或删除失败'))
-    _sc('stop', SVC)
+    p = None
+    try:
+        p = subprocess.run(['C:\\Windows\\System32\\schtasks.exe', '/delete', '/tn', TASK_NAME, '/f'],
+                           capture_output=True, text=True, errors='replace',
+                           creationflags=0x08000000)
+    except Exception:
+        pass
+    out('[1/3] 计划任务: %s' % ('已删除' if (p and p.returncode == 0) else '不存在或删除失败'))
+    out('[2/3] 看守服务: %s' % ('已删除' if _remove_tool_service() else '不存在或删除失败'))
     rc, txt = _sc('delete', SVC)
-    out('[2/2] 驱动服务: %s' % ('已删除' if rc == 0 else txt.strip()[:120]))
+    out('[3/3] 驱动服务: %s' % ('已删除' if rc == 0 else txt.strip()[:120]))
+    return 0
+
+
+def cmd_boot():
+    """开机 / 唤醒后尽早执行。已经健康就直接退出, 不健康才修复并进看守。"""
+    t_start = time.time()
+    up = uptime()
+    # 同一个入口既服务"开机"也服务"睡眠/休眠唤醒"(计划任务的三种触发器都调它),
+    # 靠系统运行时长区分, 方便事后看日志判断这次到底是哪种情况。
+    if up < 0:
+        tag = '触发'
+    elif up < 600:
+        tag = '开机'
+    else:
+        tag = '睡眠/休眠唤醒后'
+    out('[*] 进程启动(%s): 系统已运行 %.1f 秒, 解释器启动耗时 %.2f 秒'
+        % (tag, up, t_start - _T_IMPORT))
+
+    cfg = load_cfg()
+    if not ensure_driver(verbose=True):
+        out('[X] 驱动加载失败 (系统已运行 %.1f 秒)' % uptime())
+        flush_log('boot')
+        return 1
+
+    # ---- 预检: 状态正常就立刻走人, 不占 CPU ----
+    healthy = False
+    try:
+        mb = mchbar()
+        msr = rdmsr(MSR_PKG_POWER_LIMIT)
+        if mb and msr is not None:
+            d_m = decode_pl(msr)
+            v = rdphys(mb + MMIO_PL_OFF, 8)
+            if v is not None:
+                d_o = decode_pl(v)
+                pl1, _pl2 = _target_pl(cfg, d_m)
+                healthy = (d_o['lock'] == 1) and (d_o['pl1_w'] >= pl1 - 0.5)
+                if healthy:
+                    out('[*] 已是目标状态 MMIO PL1=%.2fW lock=1, 倍频 %d, 无需修复'
+                        % (d_o['pl1_w'], (rdmsr(MSR_PERF_STATUS) or 0) >> 8 & 0xFF))
+    except Exception as e:
+        out('[*] 预检异常: %s' % e)
+
+    if healthy:
+        flush_log('boot')
+        return 0
+
+    # ---- 需要修复 ----
+    out('[*] 需要修复, 开始执行 (系统已运行 %.1f 秒)' % uptime())
+    try:
+        cmd_fix(quiet=True)
+    except Exception as e:
+        out('[*] 首次修复异常: %s' % e)
+    out('[*] 首次修复结束: 用时 %.2f 秒, 系统已运行 %.1f 秒'
+        % (time.time() - t_start, uptime()))
+    flush_log('boot')          # 立刻落盘, 不必等看守结束
+
+    fixed_times = 0
+    while time.time() - t_start < BOOT_WATCH_SEC:
+        time.sleep(2.0)
+        try:
+            if not ensure_driver(verbose=False):
+                continue
+            mb = mchbar()
+            msr = rdmsr(MSR_PKG_POWER_LIMIT)
+            if not mb or msr is None:
+                continue
+            d_m = decode_pl(msr)
+            v = rdphys(mb + MMIO_PL_OFF, 8)
+            if v is None:
+                continue
+            d_o = decode_pl(v)
+            pl1, _pl2 = _target_pl(cfg, d_m)
+            # 只要"没锁"或者"比目标低"就算异常, 一律重写 + 上锁
+            if (not d_o['lock']) or d_o['pl1_w'] < pl1 - 0.5:
+                out('[*] %4.0f 秒: 功耗墙又变了 (PL1=%.2fW lock=%d), 重新锁定'
+                    % (time.time() - t_start, d_o['pl1_w'], d_o['lock']))
+                cmd_fix(quiet=True)
+                fixed_times += 1
+                flush_log('boot')
+        except Exception as e:
+            out('[*] 看守异常: %s' % e)
+
+    try:
+        if ensure_driver(verbose=False):
+            mb = mchbar()
+            v = rdphys(mb + MMIO_PL_OFF, 8) if mb else None
+            if v is not None:
+                d = decode_pl(v)
+                out('[*] 看守结束 (补锁 %d 次), MMIO PL1=%.2fW lock=%d, 当前倍频 %d'
+                    % (fixed_times, d['pl1_w'], d['lock'],
+                       (rdmsr(MSR_PERF_STATUS) or 0) >> 8 & 0xFF))
+    except Exception:
+        pass
     return 0
 
 
@@ -601,10 +949,10 @@ def main():
     cmd = sys.argv[1].lower() if len(sys.argv) > 1 else 'check'
     if cmd in ('-h', '--help', 'help', '?'):
         print(__doc__)
-        print('用法: CpuPLFix.py [check|fix|save|install|uninstall|watch]')
+        print('用法: CpuPLFix.py [check|fix|save|install|uninstall|watch|boot]')
         return 0
 
-    fn = {'check': cmd_check, 'fix': cmd_fix, 'save': cmd_save,
+    fn = {'check': cmd_check, 'fix': cmd_fix, 'save': cmd_save, 'boot': cmd_boot,
           'install': cmd_install, 'uninstall': cmd_uninstall, 'watch': cmd_watch}.get(cmd)
     if not fn:
         print('未知命令: %s' % cmd)
