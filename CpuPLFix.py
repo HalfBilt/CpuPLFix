@@ -582,6 +582,17 @@ def mmio_mode(cfg):
     return 'disable' if str(cfg.get('mmio_mode', 'disable')).lower() == 'disable' else 'value'
 
 
+_NOTED = set()          # 已经提示过的状态, 避免看守循环里反复刷同一句话
+
+
+def _note_once(key, msg):
+    """同一条提示一个进程只出一次; 返回 None 表示已提示过"""
+    if key in _NOTED:
+        return None
+    _NOTED.add(key)
+    return msg
+
+
 def _pick_profile(cfg):
     """按当前电源状态选档。返回 (pl1, pl2, 档位名); pl1=None 表示自动模式。"""
     c1 = float(cfg['pl1_w'] or 0)
@@ -654,13 +665,26 @@ def ensure_profile(cfg):
         if v is not None:
             d_o = decode_pl(v)
             if mode == 'disable':
-                if v != MMIO_DISABLED_LOCKED:
+                if v == MMIO_DISABLED_LOCKED:
+                    pass                 # 已是终态: 清零+锁, 以后什么都不用动
+                elif d_o['lock']:
+                    # MMIO 已被别的值锁死(比如老版本工具锁的 40W)。锁定位不可逆,
+                    # 本加电周期内改不了 —— 不重复写, 只提示一次, 重启后由开机流程纠正。
+                    n = _note_once('locked_stale',
+                                   'MMIO 已锁 %.1fW 无法在本周期改为清零, disable 模式需重启后生效'
+                                   % d_o['pl1_w'])
+                    if n:
+                        notes.append(n)
+                else:
+                    # 未锁(开机时固件打回的坏值) -> 一次性清零+锁
                     wrphys(mb + MMIO_PL_OFF, MMIO_DISABLED_LOCKED)
                     back = rdphys(mb + MMIO_PL_OFF, 8)
                     if back == MMIO_DISABLED_LOCKED:
                         notes.append('MMIO 清零+锁(固件侧已禁用, MSR 全权)')
                     else:
-                        notes.append('MMIO 改不动(已被旧值锁死), 需重启后生效')
+                        n = _note_once('disable_failed', 'MMIO 清零+锁未生效')
+                        if n:
+                            notes.append(n)
             else:
                 t1 = d_m['pl1_t'] or int(cfg['pl1_time'])
                 t2 = d_m['pl2_t'] or int(cfg['pl2_time'])
@@ -670,7 +694,10 @@ def ensure_profile(cfg):
                     back = rdphys(mb + MMIO_PL_OFF, 8)
                     d_b = decode_pl(back) if back is not None else None
                     if d_b and d_b['pl1_w'] < pl1 - 0.5:
-                        notes.append('MMIO 已锁 %.1fW, 升档需重启' % d_b['pl1_w'])
+                        n = _note_once('value_locked_%.0f' % d_b['pl1_w'],
+                                       'MMIO 已锁 %.1fW, 升档需重启' % d_b['pl1_w'])
+                        if n:
+                            notes.append(n)
     if notes:
         return '电源档位[%s/%s]: %s' % (name, mode, '; '.join(notes))
     return None
@@ -736,14 +763,21 @@ def cmd_fix(quiet=False):
         target = build_pl(pl1, pl2, t1, t2, bool(cfg.get('lock_mmio', True)))
 
     ok = False
-    for attempt in range(3):
-        wrphys(mmio_addr, target, 8)
-        time.sleep(0.15)
-        back = rdphys(mmio_addr, 8)
-        if back == target:
-            ok = True
-            break
-        time.sleep(0.5)
+    mmio_locked_stale = False
+    if mode == 'disable' and d_o and d_o['lock'] and mmio_before != MMIO_DISABLED_LOCKED:
+        # 锁定位不可逆: MMIO 已被旧值锁死(如老版本锁的 40W), 本周期改不了, 别白写
+        mmio_locked_stale = True
+        ok = False
+        out('跳过    : MMIO 已锁 %.1fW, 锁定位本加电周期不可逆, 无法改为清零; 重启后生效' % d_o['pl1_w'])
+    if not mmio_locked_stale:
+        for attempt in range(3):
+            wrphys(mmio_addr, target, 8)
+            time.sleep(0.15)
+            back = rdphys(mmio_addr, 8)
+            if back == target:
+                ok = True
+                break
+            time.sleep(0.5)
 
     # MSR 侧同步到目标档 —— disable 模式下这是唯一控制通道, value 模式下是实时下调通道。
     # 2026-10-18 实测本机 MSR 0x610 可写(写-0.125W 后回读确认)。
