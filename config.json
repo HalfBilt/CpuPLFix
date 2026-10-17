@@ -1,0 +1,9 @@
+{
+  "pl1_w": 0,
+  "pl2_w": 0,
+  "pl1_time": 35,
+  "pl2_time": 66,
+  "min_pl1_w": 15.0,
+  "lock_mmio": true,
+  "comment": "pl1_w/pl2_w = 0 表示自动(镜像 MSR 的值, MSR 也坏掉时退回 CPU 标称 TDP)。想固定功耗墙就填具体瓦数。"
+}
