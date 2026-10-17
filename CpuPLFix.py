@@ -38,9 +38,8 @@ SYS_DST = os.path.join(BASE, 'TSCtl.sys')
 SVC = 'TSCtl'
 SVC_TOOL = 'CpuPLFixSvc'
 TASK_NAME = 'CpuPLFix'
-BOOT_WATCH_SEC = 240         # 开机/唤醒后看守多久(秒)
+BOOT_WATCH_SEC = 300         # 开机/唤醒后看守多久(秒)
 MIN_PL_W = 5.0               # 手动指定功耗墙时的安全下限, 低于它机器会慢到没法用
-
 MCHBAR_REG = 0x48
 MMIO_PL_OFF = 0x59A0
 MSR_PKG_POWER_LIMIT = 0x610
