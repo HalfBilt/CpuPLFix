@@ -514,7 +514,38 @@ def cmd_check():
             out('[√] 当前状态正常')
     else:
         out('[X] 寄存器读取失败')
+
+    # ---- 值守状态: 确认"开机 / 睡眠唤醒"真的有人管 ----
+    out('')
+    out('%-26s %s' % ('', '值守状态'))
+    e, running = svc_state(SVC_TOOL)
+    if e and running:
+        s = '运行中  (开机自动启动, 唤醒时 1 秒内响应)'
+    elif e:
+        s = '已注册但没在运行  [!] 开机不会自动修'
+    else:
+        s = '未安装  [!] 只有计划任务在管'
+    out('%s %s' % (_pad('看守服务 CpuPLFixSvc', 26), s))
+    out('%s %s' % (_pad('日志最近一次记录', 26), _last_log_head()))
     return 0
+
+
+def _pad(s, width):
+    """按显示宽度补空格(中文算 2 格), 让中文标签也能对齐"""
+    w = sum(2 if ord(c) > 0x2E80 else 1 for c in s)
+    return s + ' ' * max(1, width - w)
+
+
+def _last_log_head():
+    """返回日志里最后一条分隔头, 例如 '2026-10-17 20:46:07 svc'"""
+    try:
+        with open(os.path.join(LOG_DIR, 'fix.log'), 'r', encoding='utf-8', errors='replace') as f:
+            hdr = [ln.strip() for ln in f if ln.startswith('=====')]
+        if not hdr:
+            return '无记录'
+        return hdr[-1].strip('= ').strip()
+    except Exception as e:
+        return '读取失败 (%s)' % e
 
 
 def _target_pl(cfg, d_m):
