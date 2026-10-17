@@ -56,11 +56,14 @@ IOCTL_PCI_READ = 0x800064A0
 DEFAULT_CFG = {
     "pl1_w": 0,
     "pl2_w": 0,
+    "pl1_w_batt": 0,
+    "pl2_w_batt": 0,
     "pl1_time": 35,
     "pl2_time": 66,
     "min_pl1_w": 15.0,
     "lock_mmio": True,
-    "comment": "pl1_w/pl2_w = 0 表示自动(取 CPU 标称 TDP, 读 MSR 0x614)。只有当 MSR 里的 PL1 低于 min_pl1_w(即系统自己也被压坏)时才会用到它们；正常情况一律沿用 MSR 里的值，不会擅自改高。"
+    "mmio_mode": "disable",
+    "comment": "pl1_w/pl2_w = 插电(高性能)档, pl1_w_batt/pl2_w_batt = 电池(平衡)档。mmio_mode: disable = MMIO清零+锁后只写MSR(免重启切档, 实测本机MSR可写时推荐); value = 写目标值进MMIO+锁(老方案, 改配置要重启)。"
 }
 
 k32 = ctypes.WinDLL('kernel32', use_last_error=True)
@@ -547,18 +550,140 @@ def _last_log_head():
         return '读取失败 (%s)' % e
 
 
+class _SYSTEM_POWER_STATUS(ctypes.Structure):
+    _fields_ = [('ACLineStatus', ctypes.c_byte),
+                ('BatteryFlag', ctypes.c_byte),
+                ('BatteryLifePercent', ctypes.c_byte),
+                ('SystemStatusFlag', ctypes.c_byte),
+                ('BatteryLifeTime', ctypes.c_ulong),
+                ('BatteryFullLifeTime', ctypes.c_ulong)]
+
+
+def on_ac():
+    """True = 接着适配器(AC), False = 电池供电。读不到时按 AC 处理(宁可费电不可变慢)。"""
+    try:
+        s = _SYSTEM_POWER_STATUS()
+        if k32.GetSystemPowerStatus(ctypes.byref(s)):
+            return s.ACLineStatus == 1
+    except Exception:
+        pass
+    return True
+
+
+MMIO_DISABLED_LOCKED = 1 << 63     # MMIO 清零 + 锁: 禁用固件侧, MSR 全权控制
+
+
+def mmio_mode(cfg):
+    """固件侧策略:
+    'value'   = 把目标 PL 写进 MMIO 再锁(老方案, 锁死后档位不可变, 改配置要重启)
+    'disable' = MMIO 清零 + 锁(焊死"禁用"状态), 之后所有档位只写 MSR, 免重启
+    实测本机 MSR 0x610 可写, 'disable' 是默认推荐。
+    """
+    return 'disable' if str(cfg.get('mmio_mode', 'disable')).lower() == 'disable' else 'value'
+
+
+def _pick_profile(cfg):
+    """按当前电源状态选档。返回 (pl1, pl2, 档位名); pl1=None 表示自动模式。"""
+    c1 = float(cfg['pl1_w'] or 0)
+    c2 = float(cfg['pl2_w'] or 0)
+    b1 = float(cfg.get('pl1_w_batt') or 0)
+    b2 = float(cfg.get('pl2_w_batt') or 0)
+    if c1 <= 0:                      # AC 档都没配 -> 自动模式
+        return None, None, '自动'
+    if (not on_ac()) and b1 > 0:     # 电池供电且配了电池档
+        p1, p2 = b1, b2
+        name = '电池/平衡'
+    else:
+        p1, p2 = c1, c2
+        name = 'AC/高性能'
+    if p2 <= 0:
+        p2 = max(25.0, p1 * 1.25)    # 只填了 pl1, PL2 给个合理的
+    if p2 < p1:
+        p2 = p1
+    return max(p1, MIN_PL_W), p2, name
+
+
+def sync_msr(pl1, pl2):
+    """把 MSR 0x610 的 PL1/PL2 同步到目标档。
+
+    保留 time window / enable 位 / MSR 自己的锁位(bit63) 一概不动。
+    用途: 运行中切档 —— CPU 取 min(MSR, MMIO), 把 MSR 压低立刻生效,
+    不需要重启; 抬高则受 MMIO 锁限制(见 ensure_profile 的提示)。
+    """
+    v = rdmsr(MSR_PKG_POWER_LIMIT)
+    if v is None:
+        return False
+    d = decode_pl(v)
+    new = build_pl(pl1, pl2, d['pl1_t'] or 35, d['pl2_t'] or 66, bool(d['lock']))
+    if new == v:
+        return True
+    wrmsr(MSR_PKG_POWER_LIMIT, new)
+    return True
+
+
+def ensure_profile(cfg):
+    """按当前电源状态把 MSR 和 MMIO 都对齐到目标档(幂等, 可反复调用)。
+
+    disable 模式: MMIO 只要不是"清零+锁"就补上, 其余全走 MSR —— 免重启切档。
+    value 模式:   MMIO 写目标值+锁, MSR 顺手同步(切档只能压低, 抬升受锁限制)。
+    返回变化描述字符串; 无变化返回 None。看守服务/计划任务每轮都调它,
+    AC <-> 电池切换后 5 秒内生效(服务还能被电源事件立即唤醒)。
+    """
+    msr = rdmsr(MSR_PKG_POWER_LIMIT)
+    if msr is None:
+        return None
+    d_m = decode_pl(msr)
+    pl1, pl2 = _target_pl(cfg, d_m)
+    _, _, name = _pick_profile(cfg)
+    notes = []
+    mode = mmio_mode(cfg)
+
+    # 1) MSR 侧同步 —— disable 模式下的唯一控制通道, value 模式下的实时下调通道
+    if pl1 is not None and (abs(d_m['pl1_w'] - pl1) > 0.5 or abs(d_m['pl2_w'] - pl2) > 0.5):
+        try:
+            sync_msr(pl1, pl2)
+            notes.append('MSR PL1 %.1f->%.1fW PL2 %.1f->%.1fW'
+                         % (d_m['pl1_w'], pl1, d_m['pl2_w'], pl2))
+        except Exception as e:
+            notes.append('MSR 同步失败: %s' % e)
+
+    # 2) MMIO 侧
+    mb = mchbar()
+    if mb:
+        v = rdphys(mb + MMIO_PL_OFF, 8)
+        if v is not None:
+            d_o = decode_pl(v)
+            if mode == 'disable':
+                if v != MMIO_DISABLED_LOCKED:
+                    wrphys(mb + MMIO_PL_OFF, MMIO_DISABLED_LOCKED)
+                    back = rdphys(mb + MMIO_PL_OFF, 8)
+                    if back == MMIO_DISABLED_LOCKED:
+                        notes.append('MMIO 清零+锁(固件侧已禁用, MSR 全权)')
+                    else:
+                        notes.append('MMIO 改不动(已被旧值锁死), 需重启后生效')
+            else:
+                t1 = d_m['pl1_t'] or int(cfg['pl1_time'])
+                t2 = d_m['pl2_t'] or int(cfg['pl2_time'])
+                if d_o['pl1_w'] < pl1 - 0.5 or (not d_o['lock'] and cfg.get('lock_mmio', True)):
+                    wrphys(mb + MMIO_PL_OFF,
+                           build_pl(pl1, pl2, t1, t2, bool(cfg.get('lock_mmio', True))))
+                    back = rdphys(mb + MMIO_PL_OFF, 8)
+                    d_b = decode_pl(back) if back is not None else None
+                    if d_b and d_b['pl1_w'] < pl1 - 0.5:
+                        notes.append('MMIO 已锁 %.1fW, 升档需重启' % d_b['pl1_w'])
+    if notes:
+        return '电源档位[%s/%s]: %s' % (name, mode, '; '.join(notes))
+    return None
+
+
 def _target_pl(cfg, d_m):
     """算出应该写进 MMIO 的目标功耗墙。cmd_fix / cmd_boot 共用同一套规则。"""
-    c1, c2 = float(cfg['pl1_w'] or 0), float(cfg['pl2_w'] or 0)
-    if c1 > 0:                              # 用户明确指定 -> 精确目标值
-        pl1 = max(c1, MIN_PL_W)
-        if pl1 != c1:
-            out('[!] pl1_w=%.1fW 低于安全下限 %.1fW, 已按下限处理' % (c1, MIN_PL_W))
-        pl2 = c2 if c2 > 0 else max(d_m['pl2_w'], pl1 * 1.25)
-        if pl2 < pl1:
-            out('[!] pl2_w=%.1fW 小于 pl1_w=%.1fW, 已按 PL1 处理' % (pl2, pl1))
-            pl2 = pl1
+    pl1, pl2, name = _pick_profile(cfg)
+    if pl1 is not None:                 # 用户明确指定 -> 精确目标值(按 AC/电池选档)
         return pl1, pl2
+    c1 = float(cfg['pl1_w'] or 0)
+    if c1 > 0:                          # 理论上到不了这里, 兜底
+        return max(c1, MIN_PL_W), (float(cfg['pl2_w'] or 0) or max(c1 * 1.25, 25.0))
     if d_m['pl1_w'] >= cfg['min_pl1_w']:    # 自动: 镜像 MSR
         return d_m['pl1_w'], d_m['pl2_w']
     tdp = rated_tdp()
@@ -590,18 +715,25 @@ def cmd_fix(quiet=False):
 
     # 目标功耗墙
     pl1, pl2 = _target_pl(cfg, d_m)
+    _, _, prof_name = _pick_profile(cfg)
     t1 = d_m['pl1_t'] or int(cfg['pl1_time'])
     t2 = d_m['pl2_t'] or int(cfg['pl2_time'])
-
-    target = build_pl(pl1, pl2, t1, t2, bool(cfg.get('lock_mmio', True)))
 
     out('修复前: MSR 0x610=0x%016X PL1=%.2fW PL2=%.2fW | MMIO +0x59A0=0x%016X PL1=%.2fW PL2=%.2fW lock=%s'
         % (msr, d_m['pl1_w'], d_m['pl2_w'],
            mmio_before if mmio_before is not None else 0,
            d_o['pl1_w'] if d_o else -1, d_o['pl2_w'] if d_o else -1,
            d_o['lock'] if d_o else '?'))
-    out('目标    : PL1=%.2fW PL2=%.2fW (%.0f秒/%.0f秒)%s'
-        % (pl1, pl2, t1, t2, ', 锁定' if cfg.get('lock_mmio', True) else ', 不锁定'))
+    mode = mmio_mode(cfg)
+    if mode == 'disable':
+        out('目标    : MMIO 清零+锁(固件侧禁用, 之后只写 MSR, 免重启切档) [%s]' % prof_name)
+        if pl1 is not None:
+            out('         MSR 设为 PL1=%.2fW PL2=%.2fW (%.0f秒/%.0f秒)' % (pl1, pl2, t1, t2))
+        target = MMIO_DISABLED_LOCKED
+    else:
+        out('目标    : PL1=%.2fW PL2=%.2fW (%.0f秒/%.0f秒) [%s]%s'
+            % (pl1, pl2, t1, t2, prof_name, ', 锁定' if cfg.get('lock_mmio', True) else ', 不锁定'))
+        target = build_pl(pl1, pl2, t1, t2, bool(cfg.get('lock_mmio', True)))
 
     ok = False
     for attempt in range(3):
@@ -613,18 +745,29 @@ def cmd_fix(quiet=False):
             break
         time.sleep(0.5)
 
-    # MSR 侧如果也被压低了, 顺手抬回(不置锁定位, 免得以后 ThrottleStop 改不动)
-    if d_m['pl1_w'] < cfg['min_pl1_w'] and not d_m['lock']:
-        wrmsr(MSR_PKG_POWER_LIMIT, build_pl(pl1, pl2, t1, t2, False))
+    # MSR 侧同步到目标档 —— disable 模式下这是唯一控制通道, value 模式下是实时下调通道。
+    # 2026-10-18 实测本机 MSR 0x610 可写(写-0.125W 后回读确认)。
+    # 不置 MSR 自己的锁位(bit63), 免得以后 ThrottleStop 改不动。
+    msr_after = None
+    if pl1 is not None:
+        try:
+            if sync_msr(pl1, pl2):
+                msr_after = decode_pl(rdmsr(MSR_PKG_POWER_LIMIT))
+                out('MSR 同步 : PL1=%.2fW PL2=%.2fW' % (msr_after['pl1_w'], msr_after['pl2_w']))
+        except Exception as e:
+            out('[!] MSR 同步失败(不影响 MMIO 锁定): %s' % e)
 
     back = rdphys(mmio_addr, 8)
     d_b = decode_pl(back) if back is not None else None
     lock_ok = False
     if d_b:
         lock_ok = (not cfg.get('lock_mmio', True)) or (d_b['lock'] == 1)
-        out('修复后: MMIO 0x%016X PL1=%.2fW PL2=%.2fW lock=%d  %s'
-            % (back, d_b['pl1_w'], d_b['pl2_w'], d_b['lock'],
-               '[√] 已生效并锁定' if (ok and lock_ok) else '[X] 未生效'))
+        if mode == 'disable':
+            out('修复后: MMIO 0x%016X (清零+锁%s)' % (back, ' [√] 固件侧已禁用' if ok else ' [X] 未生效'))
+        else:
+            out('修复后: MMIO 0x%016X PL1=%.2fW PL2=%.2fW lock=%d  %s'
+                % (back, d_b['pl1_w'], d_b['pl2_w'], d_b['lock'],
+                   '[√] 已生效并锁定' if (ok and lock_ok) else '[X] 未生效'))
     else:
         out('[X] 回读失败')
 
@@ -632,7 +775,7 @@ def cmd_fix(quiet=False):
     time.sleep(0.6)
     r0 = (rdmsr(MSR_PERF_STATUS) or 0) >> 8 & 0xFF
     out('当前倍频: %d (约 %.2f GHz)' % (r0, r0 / 10.0))
-    return 0 if (ok and lock_ok) else 1
+    return 0 if ok else 1
 
 
 def cmd_save():
@@ -872,6 +1015,7 @@ def cmd_boot():
 
     # ---- 预检: 状态正常就立刻走人, 不占 CPU ----
     healthy = False
+    mode = mmio_mode(cfg)
     try:
         mb = mchbar()
         msr = rdmsr(MSR_PKG_POWER_LIMIT)
@@ -880,11 +1024,19 @@ def cmd_boot():
             v = rdphys(mb + MMIO_PL_OFF, 8)
             if v is not None:
                 d_o = decode_pl(v)
-                pl1, _pl2 = _target_pl(cfg, d_m)
-                healthy = (d_o['lock'] == 1) and (d_o['pl1_w'] >= pl1 - 0.5)
-                if healthy:
-                    out('[*] 已是目标状态 MMIO PL1=%.2fW lock=1, 倍频 %d, 无需修复'
-                        % (d_o['pl1_w'], (rdmsr(MSR_PERF_STATUS) or 0) >> 8 & 0xFF))
+                pl1, pl2 = _target_pl(cfg, d_m)
+                msr_ok = (abs(d_m['pl1_w'] - pl1) <= 0.5 and abs(d_m['pl2_w'] - pl2) <= 0.5)
+                if mode == 'disable':
+                    healthy = (v == MMIO_DISABLED_LOCKED) and msr_ok
+                    if healthy:
+                        out('[*] 已是目标状态: MMIO 清零+锁, MSR PL1=%.2fW PL2=%.2fW, 倍频 %d, 无需修复'
+                            % (d_m['pl1_w'], d_m['pl2_w'],
+                               (rdmsr(MSR_PERF_STATUS) or 0) >> 8 & 0xFF))
+                else:
+                    healthy = (d_o['lock'] == 1) and (d_o['pl1_w'] >= pl1 - 0.5)
+                    if healthy:
+                        out('[*] 已是目标状态 MMIO PL1=%.2fW lock=1, 倍频 %d, 无需修复'
+                            % (d_o['pl1_w'], (rdmsr(MSR_PERF_STATUS) or 0) >> 8 & 0xFF))
     except Exception as e:
         out('[*] 预检异常: %s' % e)
 
@@ -908,21 +1060,11 @@ def cmd_boot():
         try:
             if not ensure_driver(verbose=False):
                 continue
-            mb = mchbar()
-            msr = rdmsr(MSR_PKG_POWER_LIMIT)
-            if not mb or msr is None:
-                continue
-            d_m = decode_pl(msr)
-            v = rdphys(mb + MMIO_PL_OFF, 8)
-            if v is None:
-                continue
-            d_o = decode_pl(v)
-            pl1, _pl2 = _target_pl(cfg, d_m)
-            # 只要"没锁"或者"比目标低"就算异常, 一律重写 + 上锁
-            if (not d_o['lock']) or d_o['pl1_w'] < pl1 - 0.5:
-                out('[*] %4.0f 秒: 功耗墙又变了 (PL1=%.2fW lock=%d), 重新锁定'
-                    % (time.time() - t_start, d_o['pl1_w'], d_o['lock']))
-                cmd_fix(quiet=True)
+            # disable 模式: 只需要保证 MMIO 还是"清零+锁" + MSR 跟着当前电源档
+            # value 模式:  MMIO 被固件压低就按当前档重写 + 上锁
+            note = ensure_profile(cfg)
+            if note:
+                out('[*] %4.0f 秒: %s' % (time.time() - t_start, note))
                 fixed_times += 1
                 flush_log('boot')
         except Exception as e:
@@ -932,11 +1074,16 @@ def cmd_boot():
         if ensure_driver(verbose=False):
             mb = mchbar()
             v = rdphys(mb + MMIO_PL_OFF, 8) if mb else None
-            if v is not None:
+            d_m = decode_pl(rdmsr(MSR_PKG_POWER_LIMIT))
+            r = (rdmsr(MSR_PERF_STATUS) or 0) >> 8 & 0xFF
+            if mode == 'disable':
+                out('[*] 看守结束 (调整 %d 次), MMIO 清零+锁=%s, MSR PL1=%.2fW PL2=%.2fW, 当前倍频 %d'
+                    % (fixed_times, '√' if v == MMIO_DISABLED_LOCKED else '✗',
+                       d_m['pl1_w'], d_m['pl2_w'], r))
+            elif v is not None:
                 d = decode_pl(v)
                 out('[*] 看守结束 (补锁 %d 次), MMIO PL1=%.2fW lock=%d, 当前倍频 %d'
-                    % (fixed_times, d['pl1_w'], d['lock'],
-                       (rdmsr(MSR_PERF_STATUS) or 0) >> 8 & 0xFF))
+                    % (fixed_times, d['pl1_w'], d['lock'], r))
     except Exception:
         pass
     return 0

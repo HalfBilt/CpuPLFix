@@ -42,7 +42,9 @@ SERVICE_CONTROL_POWEREVENT = 0x0000000D
 PBT_APMRESUMECRITICAL = 0x0006      # 从"未提前通知的休眠"恢复
 PBT_APMRESUMESUSPEND = 0x0007       # 用户操作唤醒(按键盘/开盖/按电源键)
 PBT_APMRESUMEAUTOMATIC = 0x0012     # 自动唤醒(定时器/网络事件等)
+PBT_APMPOWERSTATUSCHANGE = 0x000A   # 拔/插电源、电池电量变化 —— 切档要立即响应
 RESUME_EVENTS = (PBT_APMRESUMECRITICAL, PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC)
+ALL_EVENTS = RESUME_EVENTS + (PBT_APMPOWERSTATUSCHANGE,)
 
 POLL_FAST = 2.0      # 开机/唤醒后前 5 分钟的轮询间隔(秒)
 POLL_SLOW = 5.0      # 稳定期的轮询间隔(秒)
@@ -105,9 +107,9 @@ def _handler(control, event_type, event_data, context):
         _set_status(_status.dwCurrentState, SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_POWEREVENT)
         return 0
     if control == SERVICE_CONTROL_POWEREVENT:
-        # 睡眠 / 休眠恢复时 SCM 会送这个事件过来。这里只置标志, 日志和修复都交给
+        # 睡眠 / 休眠恢复 / 拔插电时 SCM 会送这个事件过来。这里只置标志, 日志和修复都交给
         # 工作线程去做 —— 服务控制回调里不能有阻塞操作。
-        if event_type in RESUME_EVENTS:
+        if event_type in ALL_EVENTS:
             _resume[0] = event_type
             _wake.set()
         return 0
@@ -123,6 +125,8 @@ def _log(msg):
 
 
 def _pbt_name(t):
+    if t == PBT_APMPOWERSTATUSCHANGE:
+        return '电源状态变化(拔/插电)'
     return {PBT_APMRESUMECRITICAL: '休眠恢复-未通知',
             PBT_APMRESUMESUSPEND: '用户操作唤醒',
             PBT_APMRESUMEAUTOMATIC: '自动唤醒'}.get(t, '未知')
@@ -132,26 +136,12 @@ def _check_once(cfg, quiet=True):
     """返回 True 表示状态正常; 否则修一次"""
     if not cpf.ensure_driver(verbose=False):
         return False
-    mb = cpf.mchbar()
-    msr = cpf.rdmsr(cpf.MSR_PKG_POWER_LIMIT)
-    if not mb or msr is None:
-        cpf._handle = None          # 句柄可能已失效, 下次重新打开
+    note = cpf.ensure_profile(cfg)
+    if note:
+        _log('[*] %s' % note)
+        cpf.flush_log('svc')
         return False
-    d_m = cpf.decode_pl(msr)
-    v = cpf.rdphys(mb + cpf.MMIO_PL_OFF, 8)
-    if v is None:
-        cpf._handle = None
-        return False
-    d_o = cpf.decode_pl(v)
-    pl1, _ = cpf._target_pl(cfg, d_m)
-    ok = (d_o['lock'] == 1) and (d_o['pl1_w'] >= pl1 - 0.5)
-    if ok:
-        return True
-    _log('[*] 检测到功耗墙异常: MMIO PL1=%.2fW lock=%d (目标 %.2fW), 重新锁定'
-         % (d_o['pl1_w'], d_o['lock'], pl1))
-    cpf.cmd_fix(quiet=True)
-    cpf.flush_log('svc')
-    return False
+    return True
 
 
 def _worker():
@@ -210,8 +200,11 @@ def _worker():
         if woke:
             _wake.clear()
             # 路径一: SCM 送来的电源事件 —— 唤醒后不到 1 秒就能开始检查
-            _log('[*] 收到电源事件 0x%04X (%s), 判定刚从睡眠/休眠恢复, 立即重新检查'
-                 % (_resume[0], _pbt_name(_resume[0])))
+            if _resume[0] == PBT_APMPOWERSTATUSCHANGE:
+                _log('[*] 收到电源事件 0x%04X (拔/插电), 按新电源状态切档, 立即重新检查' % _resume[0])
+            else:
+                _log('[*] 收到电源事件 0x%04X (%s), 判定刚从睡眠/休眠恢复, 立即重新检查'
+                     % (_resume[0], _pbt_name(_resume[0])))
         elif gap > interval + 20:
             # 路径二: 兜底 —— 时钟跳了一大截, 说明进程被挂起过(没收到电源事件时)
             _log('[*] 检测到 %.0f 秒挂起间隔, 判定刚从睡眠/休眠恢复, 立即重新检查' % gap)
