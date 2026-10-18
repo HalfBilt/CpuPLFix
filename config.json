@@ -40,7 +40,7 @@
         64
       ]
     ],
-    "hyst": 1.5
+    "hyst": 3.0
   },
   "guard": {
     "enabled": true,
