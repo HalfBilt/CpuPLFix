@@ -41,17 +41,18 @@
   },
   "guard": {
     "enabled": true,
-    "warn_c": 88.0,
+    "warn_c": 93.0,
     "crit_c": 96.0,
     "escape_c": 105.0,
-    "recover_c": 82.0,
+    "recover_c": 78.0,
     "warn_pl1_w": 20.0,
     "warn_pl2_w": 25.0,
     "crit_pl1_w": 10.0,
     "crit_pl2_w": 12.0,
     "dts_crit_c": 97.0,
     "force_fan_max": true,
+    "trip_flags": true,
     "escape_hibernate": false
   },
-  "comment": "默认 0 = 自动: 把 MSR 里原厂的功耗墙镜像过去, 一个瓦都不改(推荐先这么用)。想压温度就填具体瓦数, 例如 pl1_w=30, pl2_w=40; 电池档填 pl1_w_batt/pl2_w_batt。mmio_mode: disable = MMIO 清零+锁后只写 MSR(免重启切档); value = 写目标值进 MMIO+锁(老方案, 改配置要重启)。fan = 风扇模式/温度曲线(本机 EC 寄存器 0x2F, 曲线格式 [[温度上限,档位],...]); guard = 过热保护阈值, 防止摸到固件 _HOT 被强制休眠。详见 说明.txt。"
+  "comment": "默认 0 = 自动: 把 MSR 里原厂的功耗墙镜像过去, 一个瓦都不改(推荐先这么用)。想压温度就填具体瓦数, 例如 pl1_w=30, pl2_w=40; 电池档填 pl1_w_batt/pl2_w_batt。mmio_mode: disable = MMIO 清零+锁后只写 MSR(免重启切档); value = 写目标值进 MMIO+锁(老方案, 改配置要重启)。fan = 风扇模式/温度曲线(本机 EC 寄存器 0x2F, 曲线格式 [[温度上限,档位],...]); guard = 过热保护(0x78 温度线 + EC 0x89/0x8A/0x8B 固件标志线)。详见 说明.txt。"
 }

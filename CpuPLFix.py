@@ -21,8 +21,13 @@ Intel 平台的封装功耗墙(PL1/PL2)同时存在于两处, CPU 实际执行�
 守护服务(CpuPLFixSvc)在开机 / 睡眠唤醒 / 拔插电时 1 秒内对齐目标状态, 顺带管风扇与过热保护。
 
 风扇: 通过同一个驱动的端口 I/O 读写 EC, 按 config 里的温度曲线写 HFSP 档位(原生自动曲线到不了满速)。
-过热保护: 本机固件 _TZ.THM0 _HOT=401K(≈127.9°C) 摸到就强制休眠; 读不到那颗传感器,
-          所以用 EC 温度提前砍功耗墙 + 风扇拉满, 必要时主动优雅休眠。
+过热保护: 本机固件 _TZ.THM0 的 _HOT=401K(≈127.9°C), 摸到就强制休眠(S4)。查本机 DSDT 反汇编
+          DSDT 里 \\_TZ.THM0._TMP 的反汇编后确认: 真正触发它的是 **EC 自己的过热标志** 0x89/0x8A/0x8B ——
+          这三者低 7 位有任一非零, _TMP 就直接返回 _HOT; 而温度寄存器 0x78 只是平时报给 OS
+          的读数, 它的量程根本够不到 _HOT(0x80 还是"无效"哨兵值, AML 会当成 48°C)。
+          所以本工具两条线一起看:
+            1) 温度 0x78 分三级, 提前砍功耗墙 + 风扇拉满(预防, 别等固件动手);
+            2) 固件标志一置位 -> 最高级(说明固件已经在报 _HOT, 可选立刻主动优雅休眠)。
 
 底层通过 ThrottleStop 自带的内核驱动访问硬件(该驱动已由作者签名, 本机原本就能加载),
 所以不需要额外安装任何第三方驱动。
@@ -81,16 +86,17 @@ DEFAULT_CFG = {
     # ---- 过热保护: 防止跑到固件的 _HOT 阈值被强制休眠 ----
     "guard": {
         "enabled": True,
-        "warn_c": 88.0,         # EC 温度到它就压功耗墙
-        "crit_c": 96.0,         # 到它压到最低档
+        "warn_c": 93.0,         # EC 0x78 到它就压功耗墙(预防档; 0x78 实测封顶 ~99, 见 说明.txt)
+        "crit_c": 96.0,         # EC 0x78 到它压到最低档
         "escape_c": 105.0,      # 逃生阈值: 到它就(可选)主动休眠
-        "recover_c": 82.0,      # 降到它以下才解除保护
+        "recover_c": 78.0,      # 降到它以下才解除保护(别压太低, 否则 20W 会挂很久)
         "warn_pl1_w": 20.0,
         "warn_pl2_w": 25.0,
         "crit_pl1_w": 10.0,
         "crit_pl2_w": 12.0,
         "dts_crit_c": 97.0,     # CPU DTS 单独触发"严重"档
         "force_fan_max": True,  # 保护期间强制风扇满速
+        "trip_flags": True,     # EC 0x89/0x8A/0x8B 一置位就是最高级(固件真判据)
         "escape_hibernate": False
     },
     "comment": "pl1_w/pl2_w = 插电(高性能)档, pl1_w_batt/pl2_w_batt = 电池(平衡)档。mmio_mode: disable = MMIO清零+锁后只写MSR(免重启切档, 实测本机MSR可写时推荐); value = 写目标值进MMIO+锁(老方案, 改配置要重启)。fan = 风扇模式/温度曲线; guard = 过热保护阈值(原因见 说明.txt: 本机 _TZ.THM0 _HOT=401K 会强制休眠)。"
@@ -533,6 +539,14 @@ EC_HFSP, EC_TEMP, EC_FANSW, EC_RPM_LO, EC_RPM_HI = 0x2F, 0x78, 0x31, 0x84, 0x85
 FAN_AUTO, FAN_MAX = 0x80, 0x40
 FAN_LEVEL_RPM = {1: 2480, 2: 2610, 3: 2720, 4: 3190, 5: 3185, 6: 3490, 7: 3880, 64: 5000}
 
+# 固件"热到要强制休眠"的真实判据(来自本机 DSDT 里 \_TZ.THM0._TMP 的反汇编):
+#   这三个寄存器任一的低 7 位非零 -> _TMP 立刻返回 _HOT(=TCRT-1=401K≈127.9°C),
+#   于是固件/系统判定热区到顶, 强制休眠(S4)。
+#   注意: 它跟温度寄存器 0x78 的读数无关 —— 0x78 只是给 OS 看的温度(而且 0x80 是
+#   "无效"哨兵值, AML 会把它当成 48°C)。2026-10-18 那次强制休眠就是这几个标志触发的。
+EC_TRIP_FLAGS = (0x89, 0x8A, 0x8B)
+EC_TEMP_SENTINEL = 0x80        # 0x78 读到这个值 = 传感器给了无效码
+
 
 def _port_call(code, inbuf, outlen):
     """端口 IOCTL。失败时句柄多半已失效(睡眠后驱动重载等) —— 重开一次再试。
@@ -580,45 +594,132 @@ def _ec_wait(clear_obf, timeout=1.0):
     return False
 
 
-def ec_read(off):
+EC_MUTEX_NAME = 'Global\\CpuPLFix-EC'
+_ec_mx = None
+
+
+def _ec_lock(timeout_ms=3000):
+    """把 EC 端口事务跨进程串行化(看守服务 / 命令行 / 扫描工具都用这一把)。
+
+    实测教训: 两个进程同时做那套"写命令 0x80 -> 写偏移 -> 读数据"的四步事务时, 双方会
+    互相插队, 应答错位, 读出来的是对方那次事务的字节(0x78 读成 46 而实际 82)。
+    用命名互斥体(Global\\ 才能跨会话 —— 服务在 session 0, 命令行在用户会话)。
+    拿不到就退化成不加锁(尽力而为), 锁本身不会让功能失效。
+    """
+    global _ec_mx
+    if _ec_mx is None:
+        try:
+            k32.CreateMutexW.restype = w.HANDLE
+            k32.CreateMutexW.argtypes = [ctypes.c_void_p, w.BOOL, w.LPCWSTR]
+            h = k32.CreateMutexW(None, False, EC_MUTEX_NAME)
+            if not h:
+                k32.OpenMutexW.restype = w.HANDLE
+                k32.OpenMutexW.argtypes = [w.DWORD, w.BOOL, w.LPCWSTR]
+                h = k32.OpenMutexW(0x00100000 | 0x0001, False, EC_MUTEX_NAME)  # MUTEX_MODIFY_STATE|SYNCHRONIZE
+            _ec_mx = h or False
+        except Exception:
+            _ec_mx = False
+    if not _ec_mx:
+        return False
+    try:
+        r = k32.WaitForSingleObject(_ec_mx, timeout_ms)
+        return r in (0x00000000, 0x00000080)      # WAIT_OBJECT_0 / WAIT_ABANDONED(上一个持有者死了)
+    except Exception:
+        return False
+
+
+def _ec_unlock(locked):
+    if locked and _ec_mx:
+        try:
+            k32.ReleaseMutex(_ec_mx)
+        except Exception:
+            pass
+
+
+def ec_read(off, _locked=False):
     """读一个 EC 寄存器(失败返回 None)"""
-    _ec_drain()
-    if not _ec_wait(True):
-        return None
-    wr_port(EC_CTRL, 0x80)
-    if not _ec_wait(False):
-        return None
-    wr_port(EC_DATA, off)
-    if not _ec_wait(False):
-        return None
-    return rd_port(EC_DATA)
+    locked = _ec_lock() if not _locked else True
+    try:
+        _ec_drain()
+        if not _ec_wait(True):
+            return None
+        wr_port(EC_CTRL, 0x80)
+        if not _ec_wait(False):
+            return None
+        wr_port(EC_DATA, off)
+        if not _ec_wait(False):
+            return None
+        return rd_port(EC_DATA)
+    finally:
+        if not _locked:
+            _ec_unlock(locked)
 
 
-def ec_write(off, val):
+def ec_read_ok(off, tries=3):
+    """带一致性校验的读: 连续两次读到同一个值才算数, 否则重试; 都不一致就当读失败(None)。
+
+    为什么要校验: 服务(进程)和命令行/扫描工具会同时读 EC, 实测**没有互斥**时两个进程
+    的端口事务会互相插队, 结果读到的是别人那次事务的应答 —— 实测过热满载时 0x78 读出
+    46, 而同一时刻服务读到的是 82。保护等级绝对不能建立在那种垃圾值上:
+    宁可判成"这次没读到"(沿用上一次的判断), 也不要被垃圾值带偏。
+    """
+    prev = None
+    for _ in range(max(2, tries)):
+        v = ec_read(off)
+        if v is not None and prev is not None and v == prev:
+            return v
+        prev = v
+        if v is None:
+            time.sleep(0.02)
+    return None
+
+
+def ec_write(off, val, _locked=False):
     """写一个 EC 寄存器"""
-    _ec_drain()
-    if not _ec_wait(True):
-        return False
-    wr_port(EC_CTRL, 0x81)
-    if not _ec_wait(False):
-        return False
-    wr_port(EC_DATA, off)
-    if not _ec_wait(False):
-        return False
-    wr_port(EC_DATA, val)
-    if not _ec_wait(False):
-        return False
-    return True
+    locked = _ec_lock() if not _locked else True
+    try:
+        _ec_drain()
+        if not _ec_wait(True):
+            return False
+        wr_port(EC_CTRL, 0x81)
+        if not _ec_wait(False):
+            return False
+        wr_port(EC_DATA, off)
+        if not _ec_wait(False):
+            return False
+        wr_port(EC_DATA, val)
+        if not _ec_wait(False):
+            return False
+        return True
+    finally:
+        if not _locked:
+            _ec_unlock(locked)
 
 
 def ec_hfsp():
-    return ec_read(EC_HFSP)
+    return ec_read_ok(EC_HFSP)
 
 
 def ec_temp():
-    """EC 温度寄存器(°C)。本机实测 0.4~99 有效, 出界当读失败"""
-    v = ec_read(EC_TEMP)
+    """EC 温度寄存器(°C)。有效范围 0~127（0x80 是固件的"无效"哨兵值, AML 会把它当成 48°C）。
+    本机实测: 空闲 49~57, 40W 满载+满速风峰值 ~92。出界当读失败。"""
+    v = ec_read_ok(EC_TEMP)
     return v if (v is not None and 0 <= v <= 127) else None
+
+
+def ec_trip_flags():
+    """读固件判"过热强制休眠"用的标志寄存器, 返回 {offset: value}"""
+    d = {}
+    for h in EC_TRIP_FLAGS:
+        v = ec_read_ok(h)
+        if v is not None:
+            d[h] = v
+    return d
+
+
+def ec_tripped(flags):
+    """有标志置位(低 7 位非零)就返回 [(offset, value), ...]"""
+    return sorted((h, v) for h, v in (flags or {}).items() if v & 0x7F)
 
 
 def ec_rpm():
@@ -658,16 +759,20 @@ _FAN = {'idx': None}
 
 
 def fan_level_of(temp, curve, prev_idx=None, hyst=1.5):
-    """按温度曲线取 (档位, 段号)。curve 是 [[温度上限, 档位], ...] 从低到高;
-    升温立即升档; 降温要低过"本段上限 - 回差"才降, 免得在边界抖。"""
+    """按温度曲线取 (档位, 段号)。curve 是 [[温度上限, 档位], ...] 从低到高。
+
+    升温立即升档; 降温要低过"当前这一段的**下边界** - 回差"才降。
+    下边界 = curve[prev_idx - 1][0] (上一段的上限), 不是 curve[prev_idx][0] ——
+    用后者的边界是 66°C, 57°C 也能通过, 于是 57/58 来回跳档(实测踩过)。
+    """
     idx = len(curve) - 1
     for i, (hi, _lv) in enumerate(curve):
         if temp < hi:
             idx = i
             break
     if prev_idx is not None and idx < prev_idx:
-        hi = curve[prev_idx][0]
-        if temp >= hi - hyst:
+        lower = curve[prev_idx - 1][0] if prev_idx >= 1 else curve[0][0]
+        if temp >= lower - hyst:
             idx = prev_idx
     return curve[idx][1], idx
 
@@ -710,9 +815,19 @@ def fan_tick(cfg, temp=None, force_max=False):
 #
 # 本机固件设了 ACPI 热区 \_TZ.THM0 的 _HOT = 401K (≈127.9°C): 热区摸到它, 固件
 # 直接强制休眠(S4)。2026-10-18 12:43 跑满载时实测触发过一次(事件 ID 88 "严重的热事件")。
-# 当时 EC 0x78 那颗传感器只到 ~99°C, 说明固件盯的是另一颗更热的传感器, 我们读不到它,
-# 所以保护只能是"提前降温": 温度到阈值立刻砍功耗墙(PL1/PL2) + 风扇拉满;
-# 到逃生阈值可选主动优雅休眠 —— 总比固件暴力断电温和。
+#
+# 扳 DSDT 反汇编(本机 \_TZ.THM0._TMP)后发现的关键事实:
+#   * _TMP 平时返回的是 EC 0x78 换算来的温度(TC2K: x*10 + 2732, 单位 0.1K);
+#   * 但 0x78 这台机器上最高只到 ~99, 量程上够不到 _HOT(127.9°C); 而且 0x80 是
+#     "无效"哨兵值(AML 会把它当成 48°C);
+#   * 真正让 _TMP 返回 _HOT 的, 是 EC 自己的过热标志 0x89 / 0x8A / 0x8B (低 7 位非零),
+#     _TMP 一旦看到它就直接 Return (TCRT - 1) = 401K —— 这才是那次强制休眠的扳机。
+# 所以保护分两条线:
+#   1) 温度线(预防): EC 0x78 到 warn/crit 就砍功耗墙 + 风扇拉满;
+#   2) 固件标志线(最高级): 0x89/0x8A/0x8B 一置位 == 固件已经在报 _HOT,
+#      立刻压到最低功耗 + 风扇满速, 可选主动优雅休眠。
+# 诚实说明: 我们看不到 EC 内部那颗真正决定它什么时候置标志的传感器, 所以第 1 条只是
+# "提前降温", 阈值是凭经验定的, 不是精确标定。
 _PL_OVERRIDE = None
 
 
@@ -723,7 +838,9 @@ def set_pl_override(pl1, pl2=None):
     _PL_OVERRIDE = None if not pl1 else (float(pl1), float(pl2 or pl1))
 
 
-_G = {'level': None, 'since': 0.0, 'hibernate': False}
+GUARD_MAX_JUMP = 15.0      # °C/轮: 3 秒内真实温度跳不了这么多, 超过就当可疑读数, 下轮确认
+_G = {'level': None, 'since': 0.0, 'hibernate': False, 'last_et': None, 'trip_hits': 0,
+      'et_jump': False}
 
 
 def guard_cfg(cfg):
@@ -732,8 +849,21 @@ def guard_cfg(cfg):
     return d
 
 
-def guard_apply(cfg, et, dts=None):
-    """按温度定保护等级; 返回等级变化的描述(无变化返回 None)"""
+def flags_desc(flags):
+    """把固件过热标志寄存器显示成 '0x89=0x00 0x8A=0x00 0x8B=0x00'(读失败的显示 --)"""
+    flags = flags or {}
+    return ' '.join('0x%02X=%s' % (h, '--' if flags.get(h) is None else '0x%02X' % flags[h])
+                    for h in EC_TRIP_FLAGS)
+
+
+def guard_apply(cfg, et, dts=None, flags=None):
+    """定保护等级; 返回等级变化的描述(无变化返回 None)。
+
+    最高优先级看**固件自己的过热标志**: EC 0x89/0x8A/0x8B 的低 7 位。这是本机 DSDT 里
+    \\_TZ.THM0._TMP 用来"直接返回 _HOT(401K)"的判据 —— 也就是 2026-10-18 那次强制休眠
+    的真实触发者。温度寄存器 0x78 只是 _TMP 平时返回给 OS 的读数, 它本身够不到 _HOT
+    (见文件顶部 EC_TRIP_FLAGS 的说明)。
+    """
     g = guard_cfg(cfg)
     if not g.get('enabled', True):
         if _G['level']:
@@ -741,17 +871,28 @@ def guard_apply(cfg, et, dts=None):
             set_pl_override(None)
             return '过热保护: 配置里已关闭, 功耗墙恢复原档'
         return None
-    if et is None:
-        return None                     # 读不到温度就不动, 免得误判
+    hit = ec_tripped(flags) if g.get('trip_flags', True) else []   # 固件标志置位 -> 最高级
+    # 必须连续两轮都读到才认 —— 单轮的垃圾读数(两个进程插队)不能让我们误判"固件翻脸了"
+    _G['trip_hits'] = (_G.get('trip_hits', 0) + 1) if hit else 0
+    if hit and _G['trip_hits'] == 1:
+        return ('注意: 固件过热标志读到 %s —— 再确认一轮(下一轮仍读到就动作)'
+                % ', '.join('0x%02X=0x%02X' % (h, v) for h, v in hit))
     lv = None
-    if et >= g['escape_c']:
-        lv = 'escape'
-    elif et >= g['crit_c'] or (dts is not None and dts >= g.get('dts_crit_c', 97.0)):
+    if hit and _G['trip_hits'] >= 2:
+        lv = 'trip'
+    elif et is not None:                # 读不到 EC 温度就不按温度动, 免得误判
+        if et >= g['escape_c']:
+            lv = 'escape'
+        elif et >= g['crit_c']:
+            lv = 'crit'
+        elif et >= g['warn_c']:
+            lv = 'warn'
+    elif dts is not None and dts >= g.get('dts_crit_c', 97.0):
+        # EC 读不到时才拿 CPU DTS 兜底。本机 DTS(MSR 0x1B1) 满载时读数会乱走,
+        # 不能跟 EC 并列当触发条件 —— 否则会"压 10W -> 下一轮读回正常 -> 解除"地来回抖。
         lv = 'crit'
-    elif et >= g['warn_c']:
-        lv = 'warn'
     if lv is None:
-        if _G['level'] and et <= g['recover_c']:
+        if _G['level'] and et is not None and et <= g['recover_c']:
             old = _G['level']
             _G['level'] = None
             set_pl_override(None)
@@ -762,6 +903,16 @@ def guard_apply(cfg, et, dts=None):
         return None
     _G['level'] = lv
     _G['since'] = time.time()
+    if lv == 'trip':
+        set_pl_override(g['crit_pl1_w'], g['crit_pl2_w'])
+        desc = ', '.join('0x%02X=0x%02X' % (h, v) for h, v in hit)
+        if g.get('escape_hibernate'):
+            _G['hibernate'] = True
+            return ('过热保护[固件标志]: EC %s —— 固件已把热区报成 _HOT(401K), '
+                    '不等它强制断电, 立即主动休眠(S4)' % desc)
+        return ('过热保护[固件标志]: EC %s —— 这是固件判"过热"的真实判据(与 0x78 读数无关), '
+                '功耗墙压到 PL1=%.0fW/PL2=%.0fW, 风扇满速(已连续两轮确认)'
+                % (desc, g['crit_pl1_w'], g['crit_pl2_w']))
     if lv == 'escape':
         set_pl_override(g['crit_pl1_w'], g['crit_pl2_w'])
         if g.get('escape_hibernate'):
@@ -772,6 +923,10 @@ def guard_apply(cfg, et, dts=None):
                 % (et, g['escape_c']))
     if lv == 'crit':
         set_pl_override(g['crit_pl1_w'], g['crit_pl2_w'])
+        if et is None:
+            return ('过热保护[严重]: EC 温度读不到, 用 CPU DTS %d°C 兜底 —— '
+                    '功耗墙压到 PL1=%.0fW/PL2=%.0fW, 风扇满速'
+                    % (dts, g['crit_pl1_w'], g['crit_pl2_w']))
         return ('过热保护[严重]: EC %d°C ≥ %.0f°C%s —— 功耗墙压到 PL1=%.0fW/PL2=%.0fW, 风扇满速'
                 % (et, g['crit_c'], ('/DTS %d°C' % dts) if dts is not None else '',
                    g['crit_pl1_w'], g['crit_pl2_w']))
@@ -804,20 +959,44 @@ def tick(cfg=None):
         et = ec_temp()
     except Exception:
         et = None
+    prev = _G.get('last_et')
+    if et is None and prev is not None:
+        et = prev                        # 偶发读失败沿用上次值, 免得保护被莫名解除
+    elif et is not None:
+        # 实测 EC 端口事务偶尔会串位(读出来是别的寄存器的值: 满载时 0x78 读出 46, 实际 82)。
+        # 温度是慢变量, 3 秒内不可能跳 15°C 以上 —— 跳了就先当"可疑值", 本轮沿用上一次,
+        # 下一轮还是这样才认。宁可多保护一轮, 也不能拿可疑的低值去解除保护。
+        if prev is not None and abs(et - prev) > GUARD_MAX_JUMP:
+            if _G.get('et_jump'):
+                _G['et_jump'] = False    # 连续两轮都跳 -> 是真的在急升/急降, 认了
+            else:
+                _G['et_jump'] = True
+                et = prev
+        else:
+            _G['et_jump'] = False
+        _G['last_et'] = et
     dts = None
     try:
         tv = cpf_read_thermal()
         dts = tv['temp'] if tv else None
     except Exception:
         dts = None
-    n = guard_apply(cfg, et, dts)
+    flags = {}
+    try:
+        flags = ec_trip_flags()
+    except Exception:
+        flags = {}
+    if et == EC_TEMP_SENTINEL:
+        notes.append('注意: EC 温度寄存器(0x78)读到无效码 0x80 —— 固件的 ACPI 热区'
+                     '会把它当成 48°C(0x30), 属于传感器异常, 别当真温度')
+    n = guard_apply(cfg, et, dts, flags)
     if n:
         notes.append(n)
     n = ensure_profile(cfg)
     if n:
         notes.append(n)
     g = guard_cfg(cfg)
-    force = bool(g.get('force_fan_max', True)) and _G['level'] in ('warn', 'crit', 'escape')
+    force = bool(g.get('force_fan_max', True)) and _G['level'] in ('warn', 'crit', 'trip', 'escape')
     try:
         n = fan_tick(cfg, et, force_max=force)
         if n:
@@ -911,10 +1090,15 @@ def cmd_check():
         cur = ec_hfsp()
         t = ec_temp()
         r = ec_rpm()
+        fl = ec_trip_flags()
+        hit = ec_tripped(fl)
         out('%s %s' % (_pad('风扇档位 HFSP', 26),
                        ('%s (0x%02X)' % (fan_name(cur), cur)) if cur is not None else '读取失败'))
         out('%s %s' % (_pad('风扇转速', 26), ('%d RPM' % r) if r is not None else '读取失败'))
         out('%s %s' % (_pad('EC 温度 (0x78)', 26), ('%d °C' % t) if t is not None else '读取失败'))
+        out('%s %s' % (_pad('固件过热标志', 26),
+                       flags_desc(fl) + ('   [!] 已置位(固件正在报 _HOT)' if hit else '   (正常)')
+                       if fl else '读取失败'))
         out('%s %s' % (_pad('风扇模式', 26), '%s   (config.json -> fan.mode)' % f.get('mode')))
         if str(f.get('mode')).lower() == 'curve':
             out('%s %s' % (_pad('温度曲线', 26),
@@ -1654,9 +1838,13 @@ def cmd_fan(args):
         r = ec_rpm()
         t = ec_temp()
         g = guard_cfg(cfg)
+        fl = ec_trip_flags()
         out('风扇档位 HFSP : %s' % fan_name(cur))
         out('风扇转速      : %s' % (('%d RPM' % r) if r is not None else '读取失败'))
         out('EC 温度       : %s' % (('%d °C' % t) if t is not None else '读取失败'))
+        out('固件过热标志  : %s' % (flags_desc(fl) +
+                                   ('   [!] 已置位(固件正在报 _HOT)' if ec_tripped(fl) else '   (正常)')
+                                   if fl else '读取失败'))
         out('风扇模式      : %s   (config.json -> fan.mode)' % f.get('mode'))
         out('过热保护      : %s' % ('已开启 (预警 %.0f°C/严重 %.0f°C/逃生 %.0f°C)'
                                    % (g['warn_c'], g['crit_c'], g['escape_c'])
