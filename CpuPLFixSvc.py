@@ -6,6 +6,9 @@
   2. 常驻进程可以持续盯着 —— 睡眠唤醒后固件若再次压低功耗墙, 几秒内就能补锁
   3. 0.4GHz 状态下 Windows 自身启动极慢, 服务比计划任务更早拿到执行机会
 
+每轮干活(调 CpuPLFix.tick):
+  读 EC 温度 -> 过热保护(必要时压功耗墙) -> 对齐功耗墙/电源档 -> 写风扇曲线档位
+
 用法(由 CpuPLFix.py install 自动注册, 一般不需要手动运行):
     pythonw.exe CpuPLFixSvc.py --service
 """
@@ -26,7 +29,7 @@ cpf = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(cpf)
 
 SERVICE_NAME = 'CpuPLFixSvc'
-SERVICE_DISPLAY = 'CpuPLFix 功耗墙看守'
+SERVICE_DISPLAY = 'CpuPLFix 功耗墙/风扇看守'
 
 SERVICE_WIN32_OWN_PROCESS = 0x00000010
 SERVICE_START_PENDING = 2
@@ -47,7 +50,7 @@ RESUME_EVENTS = (PBT_APMRESUMECRITICAL, PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOM
 ALL_EVENTS = RESUME_EVENTS + (PBT_APMPOWERSTATUSCHANGE,)
 
 POLL_FAST = 2.0      # 开机/唤醒后前 5 分钟的轮询间隔(秒)
-POLL_SLOW = 5.0      # 稳定期的轮询间隔(秒)
+POLL_SLOW = 3.0      # 稳定期的轮询间隔(秒) —— 风扇曲线要走温度, 别太慢
 POLL_FAST_WINDOW = 300.0
 
 adv = ctypes.WinDLL('advapi32', use_last_error=True)
@@ -133,15 +136,11 @@ def _pbt_name(t):
 
 
 def _check_once(cfg, quiet=True):
-    """返回 True 表示状态正常; 否则修一次"""
+    """返回 True 表示本轮没有任何变化; 否则已经修过一轮。
+    注: 现在整轮逻辑都在 CpuPLFix.tick 里(功耗墙 + 过热保护 + 风扇), 这里只做兼容转发。"""
     if not cpf.ensure_driver(verbose=False):
         return False
-    note = cpf.ensure_profile(cfg)
-    if note:
-        _log('[*] %s' % note)
-        cpf.flush_log('svc')
-        return False
-    return True
+    return not cpf.tick(cfg)
 
 
 def _worker():
@@ -165,9 +164,11 @@ def _worker():
 
     cfg = cpf.load_cfg()
     _log('[*] 服务就绪: 进程启动于系统运行 %.1f 秒, 驱动就绪于 %.1f 秒 (耗时 %.1f 秒), '
-         '目标 PL1=%.1fW PL2=%.1fW'
+         '目标 PL1=%.1fW PL2=%.1fW, 风扇模式=%s, 过热保护=%s'
          % (t_entry, cpf.uptime(), cpf.uptime() - t_entry,
-            float(cfg['pl1_w'] or 0), float(cfg['pl2_w'] or 0)))
+            float(cfg['pl1_w'] or 0), float(cfg['pl2_w'] or 0),
+            (cfg.get('fan') or {}).get('mode', cpf.DEFAULT_CFG['fan']['mode']),
+            '开' if (cfg.get('guard') or {}).get('enabled', True) else '关'))
     _log('[*] 已订阅电源事件(SERVICE_ACCEPT_POWEREVENT): 睡眠/休眠恢复后 1 秒内响应; '
          '另有 %.0f 秒轮询兜底' % POLL_FAST)
 
@@ -183,9 +184,16 @@ def _worker():
             except Exception:
                 pass
         try:
-            _check_once(cfg)
+            notes = cpf.tick(cfg)
+            if notes:
+                for n in notes:
+                    _log('[*] %s' % n)
+                cpf.flush_log('svc')
         except Exception as e:
+            import traceback
             _log('[*] 检查异常: %s' % e)
+            _log(traceback.format_exc())
+            cpf.flush_log('svc')
 
         # 前 5 分钟每 2 秒盯一次(开机阶段最容易出问题), 之后每 5 秒一次。
         # 每次检查只是几个 IOCTL, 开销可以忽略。

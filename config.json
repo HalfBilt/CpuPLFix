@@ -1,9 +1,57 @@
 {
   "pl1_w": 0,
   "pl2_w": 0,
+  "pl1_w_batt": 0,
+  "pl2_w_batt": 0,
   "pl1_time": 35,
   "pl2_time": 66,
   "min_pl1_w": 15.0,
   "lock_mmio": true,
-  "comment": "pl1_w/pl2_w = 写进 MMIO 的功耗墙(瓦)。填 0 表示自动(镜像 MSR 的值, MSR 也坏掉时退回 CPU 标称 TDP)；填具体数字就是精确目标值, 调高调低都生效(安全下限 5W)。只填 pl1_w 不填 pl2_w 时, PL2 取 max(MSR 的 PL2, PL1 x 1.25)。min_pl1_w 是判定 MSR 是否异常的阈值(只影响自动模式)。改完必须重启才生效, 因为锁定位在本个开机电周期内不可逆。"
+  "mmio_mode": "disable",
+  "fan": {
+    "mode": "curve",
+    "level": 0,
+    "curve": [
+      [
+        50,
+        1
+      ],
+      [
+        58,
+        2
+      ],
+      [
+        66,
+        4
+      ],
+      [
+        74,
+        6
+      ],
+      [
+        82,
+        7
+      ],
+      [
+        999,
+        64
+      ]
+    ],
+    "hyst": 1.5
+  },
+  "guard": {
+    "enabled": true,
+    "warn_c": 88.0,
+    "crit_c": 96.0,
+    "escape_c": 105.0,
+    "recover_c": 82.0,
+    "warn_pl1_w": 20.0,
+    "warn_pl2_w": 25.0,
+    "crit_pl1_w": 10.0,
+    "crit_pl2_w": 12.0,
+    "dts_crit_c": 97.0,
+    "force_fan_max": true,
+    "escape_hibernate": false
+  },
+  "comment": "默认 0 = 自动: 把 MSR 里原厂的功耗墙镜像过去, 一个瓦都不改(推荐先这么用)。想压温度就填具体瓦数, 例如 pl1_w=30, pl2_w=40; 电池档填 pl1_w_batt/pl2_w_batt。mmio_mode: disable = MMIO 清零+锁后只写 MSR(免重启切档); value = 写目标值进 MMIO+锁(老方案, 改配置要重启)。fan = 风扇模式/温度曲线(本机 EC 寄存器 0x2F, 曲线格式 [[温度上限,档位],...]); guard = 过热保护阈值, 防止摸到固件 _HOT 被强制休眠。详见 说明.txt。"
 }

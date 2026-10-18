@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 CpuPLFix —— 修复开机 / 睡眠唤醒后 CPU 被锁在 0.55GHz 的问题,
-            并按 AC / 电池自动切换功耗墙(插电高性能 / 电池平衡)
+            按 AC / 电池自动切换功耗墙(插电高性能 / 电池平衡),
+            另带 EC 风扇曲线 与 过热保护(防止摸到固件 _HOT 阈值被强制休眠)
 
 原理
 ----
@@ -17,7 +18,11 @@ Intel 平台的封装功耗墙(PL1/PL2)同时存在于两处, CPU 实际执行�
   value    —— 老方案: 把目标值写进 MMIO 再锁。改配置需重启; MSR 不可写的机器用它兜底。
 
 默认按当前电源状态选档: 插电 -> pl1_w/pl2_w (高性能); 电池 -> pl1_w_batt/pl2_w_batt (平衡)。
-守护服务(CpuPLFixSvc)在开机 / 睡眠唤醒 / 拔插电时 1 秒内对齐目标状态。
+守护服务(CpuPLFixSvc)在开机 / 睡眠唤醒 / 拔插电时 1 秒内对齐目标状态, 顺带管风扇与过热保护。
+
+风扇: 通过同一个驱动的端口 I/O 读写 EC, 按 config 里的温度曲线写 HFSP 档位(原生自动曲线到不了满速)。
+过热保护: 本机固件 _TZ.THM0 _HOT=401K(≈127.9°C) 摸到就强制休眠; 读不到那颗传感器,
+          所以用 EC 温度提前砍功耗墙 + 风扇拉满, 必要时主动优雅休眠。
 
 底层通过 ThrottleStop 自带的内核驱动访问硬件(该驱动已由作者签名, 本机原本就能加载),
 所以不需要额外安装任何第三方驱动。
@@ -66,7 +71,29 @@ DEFAULT_CFG = {
     "min_pl1_w": 15.0,
     "lock_mmio": True,
     "mmio_mode": "disable",
-    "comment": "pl1_w/pl2_w = 插电(高性能)档, pl1_w_batt/pl2_w_batt = 电池(平衡)档。mmio_mode: disable = MMIO清零+锁后只写MSR(免重启切档, 实测本机MSR可写时推荐); value = 写目标值进MMIO+锁(老方案, 改配置要重启)。"
+    # ---- 风扇(可选, 本机实测有效; 其他机型没有 EC 寄存器 0x2F 就自动跳过) ----
+    "fan": {
+        "mode": "curve",        # curve = 按温度曲线自动 / max = 满速 / off = 交还 EC 自动 / level = 固定档
+        "level": 0,             # mode=level 时用: 1~7 是 EC 固定档, 64 是满速
+        "curve": [[50, 1], [58, 2], [66, 4], [74, 6], [82, 7], [999, 64]],
+        "hyst": 1.5             # 降档回差(°C), 防止温度在档位边界来回抖
+    },
+    # ---- 过热保护: 防止跑到固件的 _HOT 阈值被强制休眠 ----
+    "guard": {
+        "enabled": True,
+        "warn_c": 88.0,         # EC 温度到它就压功耗墙
+        "crit_c": 96.0,         # 到它压到最低档
+        "escape_c": 105.0,      # 逃生阈值: 到它就(可选)主动休眠
+        "recover_c": 82.0,      # 降到它以下才解除保护
+        "warn_pl1_w": 20.0,
+        "warn_pl2_w": 25.0,
+        "crit_pl1_w": 10.0,
+        "crit_pl2_w": 12.0,
+        "dts_crit_c": 97.0,     # CPU DTS 单独触发"严重"档
+        "force_fan_max": True,  # 保护期间强制风扇满速
+        "escape_hibernate": False
+    },
+    "comment": "pl1_w/pl2_w = 插电(高性能)档, pl1_w_batt/pl2_w_batt = 电池(平衡)档。mmio_mode: disable = MMIO清零+锁后只写MSR(免重启切档, 实测本机MSR可写时推荐); value = 写目标值进MMIO+锁(老方案, 改配置要重启)。fan = 风扇模式/温度曲线; guard = 过热保护阈值(原因见 说明.txt: 本机 _TZ.THM0 _HOT=401K 会强制休眠)。"
 }
 
 k32 = ctypes.WinDLL('kernel32', use_last_error=True)
@@ -486,6 +513,323 @@ def save_cfg(cfg):
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 
 
+# ================================================================ EC: 温度 / 风扇
+#
+# 风扇转速只由 EC 寄存器 HFSP(0x2F) 决定:
+#   0x00~0x07 = EC 固定档, 0x40 = 真满速(约 5000 RPM), 0x80 = 交还 EC 自动。
+# 原生自动曲线实测几乎是平的(54°C->3861 RPM, 99°C->3896 RPM), 到不了满速,
+# 所以这里自己按温度写档位。
+#
+# 底层走驱动的"端口读写"IOCTL(从驱动分发逆向得到, 与 RDMSR 同一个驱动):
+#   读端口 0x80006430   入参 u16 port                        出参 1 字节
+#   写端口 0x80006434   入参 u16 port + u16 填充 + u8 value   出参 空
+# 注意写入必须是 5 字节(值在第 5 字节), 传 3 字节会被驱动拒绝。
+# 之后按 ACPI EC 标准协议访问 EC 寄存器: 命令口 0x66, 数据口 0x62,
+# 状态位 IBF=0x02(输入缓冲满) / OBF=0x01(输出缓冲有数据), 命令 0x80=读 0x81=写。
+IOCTL_READ_PORT = 0x80006430
+IOCTL_WRITE_PORT = 0x80006434
+EC_CTRL, EC_DATA = 0x66, 0x62
+EC_HFSP, EC_TEMP, EC_FANSW, EC_RPM_LO, EC_RPM_HI = 0x2F, 0x78, 0x31, 0x84, 0x85
+FAN_AUTO, FAN_MAX = 0x80, 0x40
+FAN_LEVEL_RPM = {1: 2480, 2: 2610, 3: 2720, 4: 3190, 5: 3185, 6: 3490, 7: 3880, 64: 5000}
+
+
+def _port_call(code, inbuf, outlen):
+    """端口 IOCTL。失败时句柄多半已失效(睡眠后驱动重载等) —— 重开一次再试。
+    (CpuPLFix.ioctl 只要失败就会把全局 _handle 清空, 不重开就再也发不出去了)"""
+    ok, out = ioctl(code, inbuf, outlen)
+    if not ok:
+        ensure_driver(verbose=False)
+        ok, out = ioctl(code, inbuf, outlen)
+    return ok, out
+
+
+def rd_port(port):
+    ok, b = _port_call(IOCTL_READ_PORT, struct.pack('<H', port), 1)
+    return b[0] if ok else None
+
+
+def wr_port(port, val):
+    ok, _unused = _port_call(IOCTL_WRITE_PORT, struct.pack('<HHB', port, 0, val & 0xFF), 0)
+    return ok
+
+
+def _ec_drain():
+    """把 EC 输出缓冲里可能残留的字节读掉(最多 8 个)"""
+    for _ in range(8):
+        if not (rd_port(EC_CTRL) or 0) & 0x01:
+            return
+        rd_port(EC_DATA)
+        time.sleep(0.001)
+
+
+def _ec_wait(clear_obf, timeout=1.0):
+    """等 EC 就绪: IBF(0x02) 必须为 0; clear_obf=True 时还要求 OBF(0x01) 为 0。
+
+    注意: 这里只能等 IBF, 不能等 OBF 置位 —— TSCtl 驱动的端口读会把 OBF 自己吃掉,
+    靠 OBF 判断会把每一次读都判成超时(实测踩过)。顺序照抄已验证可用的实现。
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        st = rd_port(EC_CTRL)
+        if st is None:
+            return False
+        if (st & 0x02) == 0 and (not clear_obf or (st & 0x01) == 0):
+            return True
+        time.sleep(0.001)
+    return False
+
+
+def ec_read(off):
+    """读一个 EC 寄存器(失败返回 None)"""
+    _ec_drain()
+    if not _ec_wait(True):
+        return None
+    wr_port(EC_CTRL, 0x80)
+    if not _ec_wait(False):
+        return None
+    wr_port(EC_DATA, off)
+    if not _ec_wait(False):
+        return None
+    return rd_port(EC_DATA)
+
+
+def ec_write(off, val):
+    """写一个 EC 寄存器"""
+    _ec_drain()
+    if not _ec_wait(True):
+        return False
+    wr_port(EC_CTRL, 0x81)
+    if not _ec_wait(False):
+        return False
+    wr_port(EC_DATA, off)
+    if not _ec_wait(False):
+        return False
+    wr_port(EC_DATA, val)
+    if not _ec_wait(False):
+        return False
+    return True
+
+
+def ec_hfsp():
+    return ec_read(EC_HFSP)
+
+
+def ec_temp():
+    """EC 温度寄存器(°C)。本机实测 0.4~99 有效, 出界当读失败"""
+    v = ec_read(EC_TEMP)
+    return v if (v is not None and 0 <= v <= 127) else None
+
+
+def ec_rpm():
+    """风扇转速。读之前先往 FANSW 写 0 触发一次刷新"""
+    ec_write(EC_FANSW, 0)
+    lo, hi = ec_read(EC_RPM_LO), ec_read(EC_RPM_HI)
+    if lo is None or hi is None:
+        return None
+    return (hi << 8) | lo
+
+
+def set_fan(v):
+    """写风扇档位, 返回回读值(None = 失败)"""
+    ec_write(EC_HFSP, v)
+    return ec_hfsp()
+
+
+def fan_name(v):
+    if v is None:
+        return '读取失败'
+    if v == FAN_AUTO:
+        return 'EC 自动'
+    if v >= FAN_MAX:
+        return '满速'
+    if 1 <= v <= 7:
+        return '%d 档(约 %d RPM)' % (v, FAN_LEVEL_RPM.get(v, 0))
+    return '0x%02X' % v
+
+
+def fan_cfg(cfg):
+    d = dict(DEFAULT_CFG['fan'])
+    d.update(cfg.get('fan') or {})
+    return d
+
+
+_FAN = {'idx': None}
+
+
+def fan_level_of(temp, curve, prev_idx=None, hyst=1.5):
+    """按温度曲线取 (档位, 段号)。curve 是 [[温度上限, 档位], ...] 从低到高;
+    升温立即升档; 降温要低过"本段上限 - 回差"才降, 免得在边界抖。"""
+    idx = len(curve) - 1
+    for i, (hi, _lv) in enumerate(curve):
+        if temp < hi:
+            idx = i
+            break
+    if prev_idx is not None and idx < prev_idx:
+        hi = curve[prev_idx][0]
+        if temp >= hi - hyst:
+            idx = prev_idx
+    return curve[idx][1], idx
+
+
+def fan_tick(cfg, temp=None, force_max=False):
+    """按配置写一次风扇档位。返回变化描述; 没有变化返回 None。"""
+    f = fan_cfg(cfg)
+    mode = str(f.get('mode') or 'curve').lower()
+    if temp is None:
+        temp = ec_temp()
+    idx = None
+    if force_max:
+        want = FAN_MAX
+    elif mode == 'max':
+        want = FAN_MAX
+    elif mode in ('off', 'auto', 'ec'):
+        want = FAN_AUTO
+    elif mode == 'level':
+        want = int(f.get('level') or 0) & 0xFF
+    else:
+        if temp is None:
+            return None
+        want, idx = fan_level_of(temp, f['curve'], _FAN['idx'], float(f.get('hyst') or 1.5))
+    cur = ec_hfsp()
+    if cur is None:
+        return None
+    if cur == want:
+        _FAN['idx'] = idx
+        return None
+    got = set_fan(want)
+    _FAN['idx'] = idx
+    if got is None:
+        return '风扇: 写 0x%02X 失败(EC 无响应)' % want
+    why = ' (过热保护)' if force_max and mode != 'max' else (
+        ' (%d°C)' % temp if (idx is not None and temp is not None) else '')
+    return '风扇: %s -> %s%s' % (fan_name(cur), fan_name(got), why)
+
+
+# ================================================================ 过热保护
+#
+# 本机固件设了 ACPI 热区 \_TZ.THM0 的 _HOT = 401K (≈127.9°C): 热区摸到它, 固件
+# 直接强制休眠(S4)。2026-10-18 12:43 跑满载时实测触发过一次(事件 ID 88 "严重的热事件")。
+# 当时 EC 0x78 那颗传感器只到 ~99°C, 说明固件盯的是另一颗更热的传感器, 我们读不到它,
+# 所以保护只能是"提前降温": 温度到阈值立刻砍功耗墙(PL1/PL2) + 风扇拉满;
+# 到逃生阈值可选主动优雅休眠 —— 总比固件暴力断电温和。
+_PL_OVERRIDE = None
+
+
+def set_pl_override(pl1, pl2=None):
+    """看守服务用: 临时把功耗墙压到 pl1/pl2(过热保护); 传 None 解除。
+    只影响本进程(服务), 不写 config.json。"""
+    global _PL_OVERRIDE
+    _PL_OVERRIDE = None if not pl1 else (float(pl1), float(pl2 or pl1))
+
+
+_G = {'level': None, 'since': 0.0, 'hibernate': False}
+
+
+def guard_cfg(cfg):
+    d = dict(DEFAULT_CFG['guard'])
+    d.update(cfg.get('guard') or {})
+    return d
+
+
+def guard_apply(cfg, et, dts=None):
+    """按温度定保护等级; 返回等级变化的描述(无变化返回 None)"""
+    g = guard_cfg(cfg)
+    if not g.get('enabled', True):
+        if _G['level']:
+            _G['level'] = None
+            set_pl_override(None)
+            return '过热保护: 配置里已关闭, 功耗墙恢复原档'
+        return None
+    if et is None:
+        return None                     # 读不到温度就不动, 免得误判
+    lv = None
+    if et >= g['escape_c']:
+        lv = 'escape'
+    elif et >= g['crit_c'] or (dts is not None and dts >= g.get('dts_crit_c', 97.0)):
+        lv = 'crit'
+    elif et >= g['warn_c']:
+        lv = 'warn'
+    if lv is None:
+        if _G['level'] and et <= g['recover_c']:
+            old = _G['level']
+            _G['level'] = None
+            set_pl_override(None)
+            return '过热保护解除(EC %d°C ≤ %.0f°C): 功耗墙恢复 [%s], 原保护等级 %s' % (
+                et, g['recover_c'], _pick_profile(cfg)[2], old)
+        return None
+    if lv == _G['level']:
+        return None
+    _G['level'] = lv
+    _G['since'] = time.time()
+    if lv == 'escape':
+        set_pl_override(g['crit_pl1_w'], g['crit_pl2_w'])
+        if g.get('escape_hibernate'):
+            _G['hibernate'] = True
+            return '过热保护[逃生]: EC %d°C ≥ %.0f°C —— 主动休眠(避免固件 401K 强制断电)' % (et, g['escape_c'])
+        return ('过热保护[逃生]: EC %d°C ≥ %.0f°C —— 功耗墙已压到最低, 风扇满速'
+                '(想让它主动休眠就把 config 的 guard.escape_hibernate 改成 true)'
+                % (et, g['escape_c']))
+    if lv == 'crit':
+        set_pl_override(g['crit_pl1_w'], g['crit_pl2_w'])
+        return ('过热保护[严重]: EC %d°C ≥ %.0f°C%s —— 功耗墙压到 PL1=%.0fW/PL2=%.0fW, 风扇满速'
+                % (et, g['crit_c'], ('/DTS %d°C' % dts) if dts is not None else '',
+                   g['crit_pl1_w'], g['crit_pl2_w']))
+    set_pl_override(g['warn_pl1_w'], g['warn_pl2_w'])
+    return ('过热保护[预警]: EC %d°C ≥ %.0f°C —— 功耗墙压到 PL1=%.0fW/PL2=%.0fW, 风扇满速'
+            % (et, g['warn_c'], g['warn_pl1_w'], g['warn_pl2_w']))
+
+
+def do_hibernate():
+    """主动优雅休眠(S4): 落盘后断电, 醒来会话还在 —— 比固件的强制断电温和"""
+    out('[*] 过热保护: 立即主动休眠')
+    flush_log('guard')
+    try:
+        ctypes.windll.powrprof.SetSuspendState(1, 0, 0)
+        return True
+    except Exception as e:
+        out('[X] 主动休眠失败: %s' % e)
+        return False
+
+
+def tick(cfg=None):
+    """看守服务/计划任务每轮调一次: 读温度 -> 过热保护 -> 功耗墙 -> 风扇曲线。
+    返回本轮变化描述列表(调用方负责记日志)。"""
+    cfg = cfg if cfg is not None else load_cfg()
+    notes = []
+    if not ensure_driver(verbose=False):
+        return notes
+    et = None
+    try:
+        et = ec_temp()
+    except Exception:
+        et = None
+    dts = None
+    try:
+        tv = cpf_read_thermal()
+        dts = tv['temp'] if tv else None
+    except Exception:
+        dts = None
+    n = guard_apply(cfg, et, dts)
+    if n:
+        notes.append(n)
+    n = ensure_profile(cfg)
+    if n:
+        notes.append(n)
+    g = guard_cfg(cfg)
+    force = bool(g.get('force_fan_max', True)) and _G['level'] in ('warn', 'crit', 'escape')
+    try:
+        n = fan_tick(cfg, et, force_max=force)
+        if n:
+            notes.append(n)
+    except Exception as e:
+        notes.append('风扇写入异常: %s' % e)
+    if _G['hibernate']:
+        _G['hibernate'] = False
+        do_hibernate()
+    return notes
+
+
 # ---------------------------------------------------------------- 命令
 def cmd_check():
     if not ensure_driver():
@@ -558,6 +902,35 @@ def cmd_check():
             if ratio <= 8:
                 out('[!] 倍频只有 %.1fGHz —— 空闲态确实异常, 看上面的功耗墙状态' % (ratio / 10.0))
 
+    # ---- 风扇 / 过热保护 ----
+    out('')
+    out('%-26s %s' % ('', '风扇 / 过热保护'))
+    try:
+        f = fan_cfg(cfg)
+        g = guard_cfg(cfg)
+        cur = ec_hfsp()
+        t = ec_temp()
+        r = ec_rpm()
+        out('%s %s' % (_pad('风扇档位 HFSP', 26),
+                       ('%s (0x%02X)' % (fan_name(cur), cur)) if cur is not None else '读取失败'))
+        out('%s %s' % (_pad('风扇转速', 26), ('%d RPM' % r) if r is not None else '读取失败'))
+        out('%s %s' % (_pad('EC 温度 (0x78)', 26), ('%d °C' % t) if t is not None else '读取失败'))
+        out('%s %s' % (_pad('风扇模式', 26), '%s   (config.json -> fan.mode)' % f.get('mode')))
+        if str(f.get('mode')).lower() == 'curve':
+            out('%s %s' % (_pad('温度曲线', 26),
+                           ' '.join('≤%d°C->%s' % (hi, '满速' if lv >= FAN_MAX else '%d档' % lv)
+                                    for hi, lv in f['curve'][:-1]) + '  更高->满速'))
+        out('%s %s' % (_pad('过热保护', 26),
+                       ('已开启  预警 %.0f°C->PL1 %.0fW  严重 %.0f°C->PL1 %.0fW  逃生 %.0f°C%s'
+                        % (g['warn_c'], g['warn_pl1_w'], g['crit_c'], g['crit_pl1_w'], g['escape_c'],
+                           '(主动休眠)' if g.get('escape_hibernate') else ''))
+                       if g.get('enabled') else '已关闭'))
+        last = _last_guard_line()
+        if last:
+            out('%s %s' % (_pad('最近一次保护记录', 26), last))
+    except Exception as e:
+        out('风扇/过热保护状态读取失败: %s' % e)
+
     # ---- 值守状态: 确认"开机 / 睡眠唤醒"真的有人管 ----
     out('')
     out('%-26s %s' % ('', '值守状态'))
@@ -571,6 +944,25 @@ def cmd_check():
     out('%s %s' % (_pad('看守服务 CpuPLFixSvc', 26), s))
     out('%s %s' % (_pad('日志最近一次记录', 26), _last_log_head()))
     return 0
+
+
+def _last_guard_line():
+    """从日志里找最近一条"过热保护"动作记录 —— 保护等级是服务进程里的状态, check 看不到。
+    只认带方括号的等级行(过热保护[预警]/[严重]/[逃生]/解除), 免得匹配到风扇状态里的
+    "过热保护 : 已开启"。"""
+    try:
+        p = os.path.join(LOG_DIR, 'fix.log')
+        if not os.path.exists(p):
+            return None
+        with open(p, encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()[-400:]
+        for s in reversed(lines):
+            s = s.strip()
+            if '过热保护[' in s or '过热保护解除' in s:
+                return s[:100]
+    except Exception:
+        pass
+    return None
 
 
 def _pad(s, width):
@@ -658,7 +1050,10 @@ def cpf_read_thermal():
 
 
 def _pick_profile(cfg):
-    """按当前电源状态选档。返回 (pl1, pl2, 档位名); pl1=None 表示自动模式。"""
+    """按当前电源状态选档。返回 (pl1, pl2, 档位名); pl1=None 表示自动模式。
+    过热保护生效时由 _PL_OVERRIDE 覆盖(看守服务每轮重新对齐)。"""
+    if _PL_OVERRIDE:
+        return _PL_OVERRIDE[0], _PL_OVERRIDE[1], '过热保护'
     c1 = float(cfg['pl1_w'] or 0)
     c2 = float(cfg['pl2_w'] or 0)
     b1 = float(cfg.get('pl1_w_batt') or 0)
@@ -741,7 +1136,11 @@ def ensure_profile(cfg):
                         notes.append(n)
                 else:
                     # 未锁(开机时固件打回的坏值) -> 一次性清零+锁
-                    wrphys(mb + MMIO_PL_OFF, MMIO_DISABLED_LOCKED)
+                    # 注意必须写 8 字节: wrphys 默认 size=4, 而清零+锁的值是 bit63=1 的
+                    # 64 位数, 按 4 字节写会抛 "int too big to convert", 于是服务每次唤醒
+                    # 都静默修复失败(2026-10-18 实测: 睡眠唤醒后 MMIO 被固件打回 55W,
+                    # 服务报这个异常, 只能等计划任务里的 cmd_fix 兜底)。
+                    wrphys(mb + MMIO_PL_OFF, MMIO_DISABLED_LOCKED, 8)
                     back = rdphys(mb + MMIO_PL_OFF, 8)
                     if back == MMIO_DISABLED_LOCKED:
                         notes.append('MMIO 清零+锁(固件侧已禁用, MSR 全权)')
@@ -754,7 +1153,7 @@ def ensure_profile(cfg):
                 t2 = d_m['pl2_t'] or int(cfg['pl2_time'])
                 if d_o['pl1_w'] < pl1 - 0.5 or (not d_o['lock'] and cfg.get('lock_mmio', True)):
                     wrphys(mb + MMIO_PL_OFF,
-                           build_pl(pl1, pl2, t1, t2, bool(cfg.get('lock_mmio', True))))
+                           build_pl(pl1, pl2, t1, t2, bool(cfg.get('lock_mmio', True))), 8)
                     back = rdphys(mb + MMIO_PL_OFF, 8)
                     d_b = decode_pl(back) if back is not None else None
                     if d_b and d_b['pl1_w'] < pl1 - 0.5:
@@ -972,11 +1371,11 @@ def _quote_if_space(p):
 
 
 def _create_tool_svc(binpath):
-    ok, msg = svc_create(SVC_TOOL, binpath, 'CpuPLFix 功耗墙看守',
+    ok, msg = svc_create(SVC_TOOL, binpath, 'CpuPLFix 功耗墙/风扇看守',
                          SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL)
     if not ok:
         rc, txt = _sc('create', SVC_TOOL, 'type=', 'own', 'start=', 'auto',
-                      'error=', 'normal', 'DisplayName=', 'CpuPLFix 功耗墙看守',
+                      'error=', 'normal', 'DisplayName=', 'CpuPLFix 功耗墙/风扇看守',
                       'binPath=', binpath)
         if rc != 0:
             return False, msg or txt.strip()[:200]
@@ -1016,6 +1415,24 @@ def _install_tool_service():
 
 def _remove_tool_service():
     return svc_delete(SVC_TOOL)
+
+
+LEGACY_TASKS = ('ThinkFanCurve',)   # 旧版独立风扇曲线的计划任务, 合并进本工具后清理掉
+
+
+def _remove_legacy_tasks():
+    """清掉历史遗留的独立风扇任务, 免得它和本工具的服务抢 EC 寄存器"""
+    gone = []
+    for t in LEGACY_TASKS:
+        try:
+            p = subprocess.run(['C:\\Windows\\System32\\schtasks.exe', '/delete', '/tn', t, '/f'],
+                               capture_output=True, text=True, errors='replace',
+                               creationflags=0x08000000)
+            if p.returncode == 0:
+                gone.append(t)
+        except Exception:
+            pass
+    return gone
 
 
 def cmd_install():
@@ -1068,8 +1485,16 @@ def cmd_install():
     # 4. 立即执行一次
     out('[4/4] 立即应用一次:')
     rc = cmd_fix(quiet=False)
+    try:
+        for n in tick():
+            out('[*] %s' % n)
+    except Exception as e:
+        out('[*] 风扇/过热保护初始化异常: %s' % e)
+    gone = _remove_legacy_tasks()
+    if gone:
+        out('[i] 已清理旧版独立风扇任务: %s (风扇现在统一由本工具看守服务管)' % ', '.join(gone))
     out('')
-    out('安装完成。开机、登录、睡眠唤醒、休眠恢复都会自动修复, 日志在 %s' % LOG_DIR)
+    out('安装完成。开机、登录、睡眠唤醒、休眠恢复都会自动修复 功耗墙 + 风扇曲线 + 过热保护, 日志在 %s' % LOG_DIR)
     return rc
 
 
@@ -1085,6 +1510,9 @@ def cmd_uninstall():
     except Exception:
         pass
     out('[1/3] 计划任务: %s' % ('已删除' if (p and p.returncode == 0) else '不存在或删除失败'))
+    gone = _remove_legacy_tasks()
+    if gone:
+        out('      (顺带清理旧版独立风扇任务: %s)' % ', '.join(gone))
     out('[2/3] 看守服务: %s' % ('已删除' if _remove_tool_service() else '不存在或删除失败'))
     rc, txt = _sc('delete', SVC)
     out('[3/3] 驱动服务: %s' % ('已删除' if rc == 0 else txt.strip()[:120]))
@@ -1140,6 +1568,8 @@ def cmd_boot():
         out('[*] 预检异常: %s' % e)
 
     if healthy:
+        for n in tick(cfg):             # 功耗墙已健康, 但风扇还得按曲线走
+            out('[*] %s' % n)
         flush_log('boot')
         return 0
 
@@ -1161,10 +1591,12 @@ def cmd_boot():
                 continue
             # disable 模式: 只需要保证 MMIO 还是"清零+锁" + MSR 跟着当前电源档
             # value 模式:  MMIO 被固件压低就按当前档重写 + 上锁
-            note = ensure_profile(cfg)
-            if note:
-                out('[*] %4.0f 秒: %s' % (time.time() - t_start, note))
+            # tick 顺带做过热保护 + 风扇曲线
+            notes = tick(cfg)
+            if notes:
                 fixed_times += 1
+                for n in notes:
+                    out('[*] %4.0f 秒: %s' % (time.time() - t_start, n))
                 flush_log('boot')
         except Exception as e:
             out('[*] 看守异常: %s' % e)
@@ -1188,14 +1620,13 @@ def cmd_boot():
     return 0
 
 
-def cmd_watch(interval=30):
-    out('监控模式: 每 %d 秒对齐一次功耗墙/电源档位 (Ctrl+C 退出)' % interval)
+def cmd_watch(interval=3):
+    out('监控模式: 每 %d 秒对齐一次 功耗墙/电源档位/风扇曲线 (Ctrl+C 退出)' % interval)
     while True:
         try:
             if ensure_driver(verbose=False):
                 cfg = load_cfg()
-                note = ensure_profile(cfg)
-                if note:
+                for note in tick(cfg):
                     out('%s %s' % (datetime.datetime.now().strftime('%H:%M:%S'), note))
                     flush_log('watch')
             time.sleep(interval)
@@ -1204,6 +1635,61 @@ def cmd_watch(interval=30):
         except Exception as e:
             out('watch 异常: %s' % e)
             time.sleep(interval)
+
+
+def cmd_fan(args):
+    """fan [状态|curve|max|auto|level N] —— 看/切风扇模式(写进 config.json, 持久生效)"""
+    if not is_admin():
+        out('[!] 需要管理员权限, 正在请求提权...')
+        return 0 if elevate() else 1
+    if not ensure_driver():
+        out('[X] 驱动加载失败, 无法访问 EC')
+        return 1
+    cfg = load_cfg()
+    a = (args[0].lower() if args else 'status')
+    f = cfg.setdefault('fan', {})
+    mapped = {'curve': 'curve', 'max': 'max', 'auto': 'off', 'ec': 'off', 'off': 'off'}
+    if a in ('status', 'st', 's'):
+        cur = ec_hfsp()
+        r = ec_rpm()
+        t = ec_temp()
+        g = guard_cfg(cfg)
+        out('风扇档位 HFSP : %s' % fan_name(cur))
+        out('风扇转速      : %s' % (('%d RPM' % r) if r is not None else '读取失败'))
+        out('EC 温度       : %s' % (('%d °C' % t) if t is not None else '读取失败'))
+        out('风扇模式      : %s   (config.json -> fan.mode)' % f.get('mode'))
+        out('过热保护      : %s' % ('已开启 (预警 %.0f°C/严重 %.0f°C/逃生 %.0f°C)'
+                                   % (g['warn_c'], g['crit_c'], g['escape_c'])
+                                   if g.get('enabled') else '已关闭'))
+        return 0
+    if a == 'level':
+        n = int(args[1]) if len(args) > 1 else 0
+        if not (1 <= n <= 7 or n >= FAN_MAX):
+            out('[X] 档位只能是 1~7, 或 64(满速)')
+            return 2
+        f['mode'] = 'level'
+        f['level'] = n
+        save_cfg(cfg)
+        got = set_fan(n)
+        out('[√] 风扇固定到 %s (config: fan.mode=level, fan.level=%d)' % (fan_name(got), n))
+        out('    守护服务会一直维持这个档位; 想恢复自动曲线执行 fan curve')
+        return 0
+    if a in mapped:
+        f['mode'] = mapped[a]
+        save_cfg(cfg)
+        cur = ec_hfsp()
+        if a == 'max':
+            set_fan(FAN_MAX)
+        elif a == 'curve' and ec_temp() is not None:
+            fan_tick(cfg, ec_temp())          # 立即按曲线给一个档, 不用等下一轮
+        tips = {'curve': '按温度自动(见 fan.curve)', 'max': '固定满速',
+                'auto': '交还 EC 原生自动(本机原生曲线偏平, 到不了满速)'}
+        out('[√] 风扇模式 -> %s (%s)' % (mapped[a], tips.get(a, '')))
+        out('    现在: %s, %s' % (fan_name(ec_hfsp()),
+                                  ('%d RPM' % ec_rpm()) if ec_rpm() is not None else ''))
+        return 0
+    out('用法: CpuPLFix.py fan [状态|curve|max|auto|level N]')
+    return 2
 
 
 def main():
@@ -1219,8 +1705,20 @@ def main():
     cmd = sys.argv[1].lower() if len(sys.argv) > 1 else 'check'
     if cmd in ('-h', '--help', 'help', '?'):
         print(__doc__)
-        print('用法: CpuPLFix.py [check|fix|save|install|uninstall|watch|boot]')
+        print('用法: CpuPLFix.py [check|fix|save|install|uninstall|watch|boot|fan]')
+        print('  风扇: CpuPLFix.py fan [状态|curve|max|auto|level N]')
         return 0
+
+    if cmd == 'fan':
+        try:
+            rc = cmd_fan(sys.argv[2:])
+        except Exception as e:
+            import traceback
+            out('[X] 异常: %s' % e)
+            out(traceback.format_exc())
+            rc = 1
+        flush_log('fan')
+        return rc or 0
 
     fn = {'check': cmd_check, 'fix': cmd_fix, 'save': cmd_save, 'boot': cmd_boot,
           'install': cmd_install, 'uninstall': cmd_uninstall, 'watch': cmd_watch}.get(cmd)
