@@ -1,20 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-CpuPLFix —— 修复开机 / 睡眠唤醒后 CPU 被锁在 0.55GHz 的问题
+CpuPLFix —— 修复开机 / 睡眠唤醒后 CPU 被锁在 0.55GHz 的问题,
+            并按 AC / 电池自动切换功耗墙(插电高性能 / 电池平衡)
 
 原理
 ----
-Intel 平台的封装功耗墙(PL1/PL2)同时存在于两处:
+Intel 平台的封装功耗墙(PL1/PL2)同时存在于两处, CPU 实际执行的是两者的 min:
   1) MSR 0x610  (PKG_POWER_LIMIT)         —— CPU 内部, 操作系统/ThrottleStop 用这一份
   2) MCHBAR+0x59A0 (MMIO 镜像)            —— 主板/EC 固件用的那一份, bit63 是锁定位
 
-本机实测(正常状态):
-  MSR 0x610      = PL1 55W / PL2 55W / 未锁
-  MCHBAR+0x59A0  = PL1 21W / PL2 55W / 未锁     <-- 被固件压低, 且随时可能被改得更低
-降频到 0.55GHz 时, 这份 MMIO 值会被写成只有几瓦, CPU 于是被钉在最低频。
+本机实测(故障状态): 固件会在开机/唤醒时把 MMIO 那份打成 5~21W, CPU 于是被钉在最低频。
 
-本工具做的事: 把 MSR 里那份正常值写回 MMIO, 并置 bit63 锁定位,
-固件之后就无法再改回去 —— 与 ThrottleStop 的 "MMIO Lock" 完全等价, 但无需 GUI、开机即可自动执行。
+两种工作模式(mmio_mode):
+  disable  —— 开机把 MMIO "清零 + 锁死"(等于把固件侧永久禁用), 之后所有档位只写 MSR。
+               实测本机 MSR 0x610 可写。改档/改配置/拔插电都不需要重启。
+  value    —— 老方案: 把目标值写进 MMIO 再锁。改配置需重启; MSR 不可写的机器用它兜底。
+
+默认按当前电源状态选档: 插电 -> pl1_w/pl2_w (高性能); 电池 -> pl1_w_batt/pl2_w_batt (平衡)。
+守护服务(CpuPLFixSvc)在开机 / 睡眠唤醒 / 拔插电时 1 秒内对齐目标状态。
 
 底层通过 ThrottleStop 自带的内核驱动访问硬件(该驱动已由作者签名, 本机原本就能加载),
 所以不需要额外安装任何第三方驱动。
@@ -490,39 +493,77 @@ def cmd_check():
         return 1
     out('驱动版本: %s' % struct.unpack('<I', ioctl(IOCTL_VERSION, b'', 4)[1][:4])[0])
 
+    cfg = load_cfg()
     mb = mchbar()
     msr = rdmsr(MSR_PKG_POWER_LIMIT)
     mmio = rdphys(mb + MMIO_PL_OFF, 8) if mb else None
     d_m = decode_pl(msr) if msr is not None else None
     d_o = decode_pl(mmio) if mmio is not None else None
+    mode = mmio_mode(cfg)
 
     ratio = (rdmsr(MSR_PERF_STATUS) or 0) >> 8 & 0xFF
 
     out('')
     out('CPU 当前倍频      : %d  (约 %.2f GHz)' % (ratio, ratio / 10.0))
     out('MCHBAR            : %s' % (('0x%X' % mb) if mb else '读取失败'))
+    out('当前电源          : %s' % ('AC 适配器' if on_ac() else '电池'))
+    if d_m:
+        out('生效档位          : [%s] MSR PL1=%.2fW PL2=%.2fW (mmio_mode=%s)'
+            % (_pick_profile(cfg)[2], d_m['pl1_w'], d_m['pl2_w'], mode))
     out('')
     out('%-26s %-22s %s' % ('', 'MSR 0x610 (系统侧)', 'MMIO +0x59A0 (固件侧)'))
     if d_m and d_o:
-        out('%-26s %-22s %s' % ('PL1 长时功耗墙', '%.2f W' % d_m['pl1_w'], '%.2f W' % d_o['pl1_w']))
-        out('%-26s %-22s %s' % ('PL2 短时功耗墙', '%.2f W' % d_m['pl2_w'], '%.2f W' % d_o['pl2_w']))
-        out('%-26s %-22s %s' % ('锁定位 bit63', d_m['lock'], d_o['lock']))
-        out('')
-        if abs(d_m['pl1_w'] - d_o['pl1_w']) > 0.5:
-            out('[!] 两侧 PL1 不一致 —— 这正是降频的根源')
-        if not d_o['lock']:
-            out('[!] MMIO 未锁定 —— 固件随时可以再把它改低')
-        if d_m['pl1_w'] >= d_o['pl1_w'] - 0.5 and d_o['lock']:
-            out('[√] 当前状态正常')
+        if mode == 'disable':
+            mmio_desc = ('清零+锁(已禁用)' if mmio == MMIO_DISABLED_LOCKED
+                         else 'PL1=%.2fW(未禁用!)' % d_o['pl1_w'])
+            out('%-26s %-22s %s' % ('PL1 长时功耗墙', '%.2f W' % d_m['pl1_w'], mmio_desc))
+            out('%-26s %-22s %s' % ('PL2 短时功耗墙', '%.2f W' % d_m['pl2_w'], '—'))
+            out('%-26s %-22s %s' % ('锁定位 bit63', d_m['lock'], d_o['lock']))
+            out('')
+            if mmio == MMIO_DISABLED_LOCKED:
+                out('生效值 = MSR 侧 = %.2fW (MMIO 已清零禁用, 不参与 min)' % d_m['pl1_w'])
+            else:
+                out('生效值 = min(MSR, MMIO) = %.2fW' % min(d_m['pl1_w'], d_o['pl1_w']))
+            if mmio == MMIO_DISABLED_LOCKED:
+                out('[√] 当前状态正常 (固件侧已禁用, 功耗墙由 MSR 控制)')
+            else:
+                out('[!] MMIO 未处于"清零+锁"终态 —— disable 模式需重启后生效')
+                out('    (或把 config 的 mmio_mode 改回 value, 老方案)')
+        else:
+            out('%-26s %-22s %s' % ('PL1 长时功耗墙', '%.2f W' % d_m['pl1_w'], '%.2f W' % d_o['pl1_w']))
+            out('%-26s %-22s %s' % ('PL2 短时功耗墙', '%.2f W' % d_m['pl2_w'], '%.2f W' % d_o['pl2_w']))
+            out('%-26s %-22s %s' % ('锁定位 bit63', d_m['lock'], d_o['lock']))
+            out('')
+            if d_m['pl1_w'] >= d_o['pl1_w'] - 0.5 and d_o['lock']:
+                out('[√] 当前状态正常')
+            else:
+                if abs(d_m['pl1_w'] - d_o['pl1_w']) > 0.5:
+                    out('[!] 两侧 PL1 不一致 —— 这正是降频的根源')
+                if not d_o['lock']:
+                    out('[!] MMIO 未锁定 —— 固件随时可以再把它改低')
     else:
         out('[X] 寄存器读取失败')
+
+    # ---- 降频自查: 温度(注意 DTS 换算公式) ----
+    out('')
+    out('%-26s %s' % ('', '降频自查'))
+    tv = cpf_read_thermal()
+    if tv:
+        if tv['temp'] >= 90:
+            out('CPU 温度           : %d °C  [!] 接近/达到 TjMax — 这是温度墙限频, 和功耗墙无关' % tv['temp'])
+            out('                     (治本: 清灰换硅脂; 或把 pl1_w 降到 35~40)')
+        else:
+            out('CPU 温度           : %d °C  (TjMax=%d, 公式 TjMax-DTS; 仅空闲可信, 满载会失真)'
+                % (tv['temp'], tv['tjmax']))
+            if ratio <= 8:
+                out('[!] 倍频只有 %.1fGHz —— 空闲态确实异常, 看上面的功耗墙状态' % (ratio / 10.0))
 
     # ---- 值守状态: 确认"开机 / 睡眠唤醒"真的有人管 ----
     out('')
     out('%-26s %s' % ('', '值守状态'))
     e, running = svc_state(SVC_TOOL)
     if e and running:
-        s = '运行中  (开机自动启动, 唤醒时 1 秒内响应)'
+        s = '运行中  (开机自动启动, 唤醒/拔插电 1 秒内响应)'
     elif e:
         s = '已注册但没在运行  [!] 开机不会自动修'
     else:
@@ -591,6 +632,29 @@ def _note_once(key, msg):
         return None
     _NOTED.add(key)
     return msg
+
+
+def cpf_read_thermal():
+    """按 Intel SDM 正确公式读 CPU 温度: 温度 = TjMax - DTS。
+
+    MSR 0x1B1 bits 22:16 是"距 TjMax 的余量"而不是摄氏度(早期脚本直接当温度读,
+    得出过"满载 0°C"的荒谬值)。TjMax 从 0x1A2 读。
+    返回 {'temp', 'tjmax', 'thermal_status'(=1 表示已到节流点)}; 失败返回 None。
+    注意: DTS 空闲时可信; 满载时该寄存器行为异常(实测读数反而走低), 别迷信。
+    """
+    try:
+        v = rdmsr(0x1A2)
+        tjmax = ((v >> 16) & 0xFF) if v else 100
+        if tjmax < 50 or tjmax > 120:
+            tjmax = 100
+        tv = rdmsr(0x1B1)
+        if tv is None:
+            return None
+        return {'temp': tjmax - ((tv >> 16) & 0x7F),
+                'tjmax': tjmax,
+                'thermal_status': tv & 1}
+    except Exception:
+        return None
 
 
 def _pick_profile(cfg):
@@ -825,7 +889,8 @@ def cmd_save():
     cfg.update({'pl1_w': d['pl1_w'], 'pl2_w': d['pl2_w'],
                 'pl1_time': d['pl1_t'], 'pl2_time': d['pl2_t']})
     save_cfg(cfg)
-    out('[√] 已保存参考值: PL1=%.2fW PL2=%.2fW' % (d['pl1_w'], d['pl2_w']))
+    out('[√] 已保存为插电(AC)档: PL1=%.2fW PL2=%.2fW' % (d['pl1_w'], d['pl2_w']))
+    out('    电池档 pl1_w_batt/pl2_w_batt 未改动; disable 模式下 1 分钟内 MSR 生效, 无需重启')
     return 0
 
 
@@ -1124,21 +1189,15 @@ def cmd_boot():
 
 
 def cmd_watch(interval=30):
-    out('监控模式: 每 %d 秒检查一次, 功耗墙被改动就立刻恢复 (Ctrl+C 退出)' % interval)
+    out('监控模式: 每 %d 秒对齐一次功耗墙/电源档位 (Ctrl+C 退出)' % interval)
     while True:
         try:
             if ensure_driver(verbose=False):
                 cfg = load_cfg()
-                mb = mchbar()
-                msr = rdmsr(MSR_PKG_POWER_LIMIT)
-                if mb and msr:
-                    d_m = decode_pl(msr)
-                    v = rdphys(mb + MMIO_PL_OFF, 8)
-                    d_o = decode_pl(v) if v is not None else None
-                    if d_o and (d_o['pl1_w'] < cfg['min_pl1_w'] or not d_o['lock']):
-                        out('%s 检测到功耗墙异常, 重新应用...'
-                            % datetime.datetime.now().strftime('%H:%M:%S'))
-                        cmd_fix(quiet=True)
+                note = ensure_profile(cfg)
+                if note:
+                    out('%s %s' % (datetime.datetime.now().strftime('%H:%M:%S'), note))
+                    flush_log('watch')
             time.sleep(interval)
         except KeyboardInterrupt:
             return 0
