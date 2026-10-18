@@ -26,16 +26,19 @@ def step(desc, got, want_sub):
         FAIL.append(desc)
 
 
-print('=== guard_apply: 温度线 ===')
+g = cfg['guard']
+w, c, e, r = g['warn_c'], g['crit_c'], g['escape_c'], g['recover_c']
+
+print('=== guard_apply: 温度线（阈值直接读 config：预警 %g / 严重 %g / 逃生 %g / 解除 %g） ===' % (w, c, e, r))
 cpf._G['level'] = None
-step('EC 90°C (低于预警 93)', cpf.guard_apply(cfg, 90, None, {0x89: 0, 0x8A: 0, 0x8B: 0}), None)
-step('EC 93°C', cpf.guard_apply(cfg, 93, None, {}), '预警')
-step('EC 94°C (同档不重复报)', cpf.guard_apply(cfg, 94, None, {}), None)
-step('EC 96°C', cpf.guard_apply(cfg, 96, None, {}), '严重')
-step('EC 105°C', cpf.guard_apply(cfg, 105, None, {}), '逃生')
-step('EC 100°C (逃生->严重, 降档也是一次变化)', cpf.guard_apply(cfg, 100, None, {}), '严重')
-step('EC 100°C (同上, 不重复报)', cpf.guard_apply(cfg, 100, None, {}), None)
-step('EC 77°C -> 解除(77<=78)', cpf.guard_apply(cfg, 77, None, {}), '解除')
+step('EC %g°C (低于预警)' % (w - 1), cpf.guard_apply(cfg, w - 1, None, {0x89: 0, 0x8A: 0, 0x8B: 0}), None)
+step('EC %g°C (到预警)' % w, cpf.guard_apply(cfg, w, None, {}), '预警')
+step('EC %g°C (同档不重复报)' % (w + 1), cpf.guard_apply(cfg, w + 1, None, {}), None)
+step('EC %g°C (到严重)' % c, cpf.guard_apply(cfg, c, None, {}), '严重')
+step('EC %g°C (到逃生)' % e, cpf.guard_apply(cfg, e, None, {}), '逃生')
+step('EC %g°C (逃生->严重, 降档也是一次变化)' % (e - 5), cpf.guard_apply(cfg, e - 5, None, {}), '严重')
+step('EC %g°C (同上, 不重复报)' % (e - 5), cpf.guard_apply(cfg, e - 5, None, {}), None)
+step('EC %g°C -> 解除(%g<=%g)' % (r - 1, r - 1, r), cpf.guard_apply(cfg, r - 1, None, {}), '解除')
 
 print('=== guard_apply: 固件标志线(0x89/0x8A/0x8B, 需连续两轮确认) ===')
 cpf._G['level'] = None
