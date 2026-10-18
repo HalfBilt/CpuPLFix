@@ -636,8 +636,8 @@ def _ec_unlock(locked):
             pass
 
 
-def ec_read(off, _locked=False):
-    """读一个 EC 寄存器(失败返回 None)"""
+def ec_read(off, _locked=False, delay=0.003):
+    """读一个 EC 寄存器(失败返回 None)。delay = 写完偏移后等 EC 应答的时间(秒)"""
     locked = _ec_lock() if not _locked else True
     try:
         _ec_drain()
@@ -649,6 +649,10 @@ def ec_read(off, _locked=False):
         wr_port(EC_DATA, off)
         if not _ec_wait(False):
             return None
+        # 等 EC 把结果放进输出缓冲。EC 忙(满载时它自己在管风扇/热区)时不会立刻应答,
+        # 不等就直接读, 读到的往往是上一次留在缓冲里的残留字节 —— 实测满载扫描时
+        # 一次"读 0x8A"读到的是 0x7A 的值(46), 而且连读两次都是这个残留值。
+        time.sleep(delay)
         return rd_port(EC_DATA)
     finally:
         if not _locked:
@@ -656,21 +660,20 @@ def ec_read(off, _locked=False):
 
 
 def ec_read_ok(off, tries=3):
-    """带一致性校验的读: 连续两次读到同一个值才算数, 否则重试; 都不一致就当读失败(None)。
+    """带一致性校验的读: 连续两次读到同一个值才算数, 否则加大等待重试; 都不一致就返回 None。
 
-    为什么要校验: 服务(进程)和命令行/扫描工具会同时读 EC, 实测**没有互斥**时两个进程
-    的端口事务会互相插队, 结果读到的是别人那次事务的应答 —— 实测过热满载时 0x78 读出
-    46, 而同一时刻服务读到的是 82。保护等级绝对不能建立在那种垃圾值上:
-    宁可判成"这次没读到"(沿用上一次的判断), 也不要被垃圾值带偏。
+    两道保险一起用:
+      1) 读之前等一会儿(第一次 3ms, 重试 8/20ms) —— 防"抢在 EC 应答之前读"拿到残留字节;
+      2) 连读两次比对 —— 防两个进程的事务互相插队时读到对方的应答。
+    校验不过就宁可判成"这次没读到"(沿用上一次的判断), 也不拿可疑值去改保护等级。
     """
     prev = None
-    for _ in range(max(2, tries)):
-        v = ec_read(off)
+    delays = (0.003, 0.008, 0.020)
+    for i in range(max(2, tries)):
+        v = ec_read(off, delay=delays[min(i, len(delays) - 1)])
         if v is not None and prev is not None and v == prev:
             return v
         prev = v
-        if v is None:
-            time.sleep(0.02)
     return None
 
 
