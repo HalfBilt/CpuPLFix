@@ -3,3 +3,4 @@ logs/
 __pycache__/
 *.pyc
 _task.xml
+dev/ec_scan_out.txt
