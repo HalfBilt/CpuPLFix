@@ -7,7 +7,12 @@
   3. 0.4GHz 状态下 Windows 自身启动极慢, 服务比计划任务更早拿到执行机会
 
 每轮干活(调 CpuPLFix.tick):
-  读 EC 温度 -> 过热保护(必要时压功耗墙) -> 对齐功耗墙/电源档 -> 写风扇曲线档位
+  (按节奏读 EC 温度) -> 过热保护(必要时压功耗墙) -> 对齐功耗墙/电源档 -> (按节奏)写风扇档位
+
+轮询节奏由 CpuPLFix.poll_plan 按 config 的 poll_s/ec_poll_s/flag_poll_s 算:
+  主循环(功耗墙/电源档, 只碰 MSR/MMIO)默认 5 秒; EC 读(温度 + 风扇档位)默认 15 秒;
+  固件过热标志默认 30 秒。开机前 5 分钟、过热保护生效期间、EC 温度超过 guard.flag_hot_c
+  时都会自动加密 —— 目的是少打扰慢速的 EC(本机实测 EC 偶尔会串位/超时)。
 
 用法(由 CpuPLFix.py install 自动注册, 一般不需要手动运行):
     pythonw.exe CpuPLFixSvc.py --service
@@ -49,9 +54,9 @@ PBT_APMPOWERSTATUSCHANGE = 0x000A   # 拔/插电源、电池电量变化 —— 
 RESUME_EVENTS = (PBT_APMRESUMECRITICAL, PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC)
 ALL_EVENTS = RESUME_EVENTS + (PBT_APMPOWERSTATUSCHANGE,)
 
-POLL_FAST = 2.0      # 开机/唤醒后前 5 分钟的轮询间隔(秒)
-POLL_SLOW = 3.0      # 稳定期的轮询间隔(秒) —— 风扇曲线要走温度, 别太慢
-POLL_FAST_WINDOW = 300.0
+POLL_FAST_WINDOW = 300.0     # 开机/唤醒后前 5 分钟按 poll_plan(fast=True) 加密轮询
+# 轮询间隔(主循环/EC 读/固件标志读)统一由 CpuPLFix.poll_plan 按 config 算:
+# 主循环只碰 MSR/MMIO, 可以快; 温度/风扇/固件标志走 EC, 默认 15/30 秒一次。
 
 adv = ctypes.WinDLL('advapi32', use_last_error=True)
 
@@ -135,14 +140,6 @@ def _pbt_name(t):
             PBT_APMRESUMEAUTOMATIC: '自动唤醒'}.get(t, '未知')
 
 
-def _check_once(cfg, quiet=True):
-    """返回 True 表示本轮没有任何变化; 否则已经修过一轮。
-    注: 现在整轮逻辑都在 CpuPLFix.tick 里(功耗墙 + 过热保护 + 风扇), 这里只做兼容转发。"""
-    if not cpf.ensure_driver(verbose=False):
-        return False
-    return not cpf.tick(cfg)
-
-
 def _worker():
     # 开机早期驱动可能还没准备好, 最多等 3 分钟
     t_entry = cpf.uptime()
@@ -169,12 +166,16 @@ def _worker():
             float(cfg['pl1_w'] or 0), float(cfg['pl2_w'] or 0),
             (cfg.get('fan') or {}).get('mode', cpf.DEFAULT_CFG['fan']['mode']),
             '开' if (cfg.get('guard') or {}).get('enabled', True) else '关'))
-    _log('[*] 已订阅电源事件(SERVICE_ACCEPT_POWEREVENT): 睡眠/休眠恢复后 1 秒内响应; '
-         '另有 %.0f 秒轮询兜底' % POLL_FAST)
+    poll_i, ec_i, fl_i = cpf.poll_plan(cfg)
+    _log('[*] 已订阅电源事件(SERVICE_ACCEPT_POWEREVENT): 睡眠/休眠恢复后 1 秒内响应')
+    _log('[*] 轮询节奏: 主循环 %.0f 秒(只对功耗墙/电源档, 不碰 EC) / EC 读 %.0f 秒 / '
+         '固件标志 %.0f 秒 —— 开机前 5 分钟和过热保护期间自动加密'
+         % (poll_i, ec_i, fl_i))
 
     t0 = time.time()
     last = time.time()
     last_cfg = time.time()
+    last_ec = last_fl = 0.0          # 0 → 第一轮立刻读一次 EC
     while not _stop.is_set():
         # 每分钟重读一次 config.json, 改完不用重启服务就生效
         if time.time() - last_cfg > 60:
@@ -183,8 +184,20 @@ def _worker():
                 cfg = cpf.load_cfg()
             except Exception:
                 pass
+        now = time.time()
+        fast = (now - t0) < POLL_FAST_WINDOW
+        guard = cpf.guard_level() is not None
+        t = cpf.last_ec_temp()
+        hot = t is not None and t >= cpf.flag_hot_c(cfg)
+        poll_i, ec_i, fl_i = cpf.poll_plan(cfg, fast=fast, guard=guard, hot=hot)
+        do_ec = (now - last_ec) >= ec_i
+        do_fl = do_ec and (now - last_fl) >= fl_i
+        if do_ec:
+            last_ec = now
+        if do_fl:
+            last_fl = now
         try:
-            notes = cpf.tick(cfg)
+            notes = cpf.tick(cfg, ec=do_ec, read_flags=do_fl)
             if notes:
                 for n in notes:
                     _log('[*] %s' % n)
@@ -195,10 +208,7 @@ def _worker():
             _log(traceback.format_exc())
             cpf.flush_log('svc')
 
-        # 前 5 分钟每 2 秒盯一次(开机阶段最容易出问题), 之后每 5 秒一次。
-        # 每次检查只是几个 IOCTL, 开销可以忽略。
-        interval = POLL_FAST if (time.time() - t0) < POLL_FAST_WINDOW else POLL_SLOW
-        woke = _wake.wait(interval)
+        woke = _wake.wait(poll_i)
         if _stop.is_set():
             break
 
@@ -207,14 +217,16 @@ def _worker():
         last = now
         if woke:
             _wake.clear()
+            last_ec = last_fl = 0.0      # 唤醒/拔插电后下一轮立刻整套重读
             # 路径一: SCM 送来的电源事件 —— 唤醒后不到 1 秒就能开始检查
             if _resume[0] == PBT_APMPOWERSTATUSCHANGE:
                 _log('[*] 收到电源事件 0x%04X (拔/插电), 按新电源状态切档, 立即重新检查' % _resume[0])
             else:
                 _log('[*] 收到电源事件 0x%04X (%s), 判定刚从睡眠/休眠恢复, 立即重新检查'
                      % (_resume[0], _pbt_name(_resume[0])))
-        elif gap > interval + 20:
+        elif gap > poll_i + 20:
             # 路径二: 兜底 —— 时钟跳了一大截, 说明进程被挂起过(没收到电源事件时)
+            last_ec = last_fl = 0.0
             _log('[*] 检测到 %.0f 秒挂起间隔, 判定刚从睡眠/休眠恢复, 立即重新检查' % gap)
 
 

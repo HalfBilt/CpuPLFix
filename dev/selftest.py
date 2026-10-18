@@ -80,6 +80,46 @@ print('  ec_tripped({0x89:0,0x8A:0,0x80,0x8B:0}) =', cpf.ec_tripped({0x89: 0, 0x
 print('  flags_desc =', cpf.flags_desc({0x89: 0, 0x8A: 0x80, 0x8B: None}))
 print('  EC_TRIP_FLAGS =', ['0x%02X' % h for h in cpf.EC_TRIP_FLAGS])
 
+print('=== 轮询节奏 poll_plan: 少打扰 EC ===')
+
+
+def chk(desc, ok, extra=''):
+    print('  [%s] %-46s %s' % ('OK' if ok else '!!', desc, extra))
+    if not ok:
+        FAIL.append(desc)
+
+
+d = cpf.poll_plan(dict(cpf.DEFAULT_CFG))
+chk('默认 主循环/EC/标志 = %.0f/%.0f/%.0f 秒' % d, d == (5.0, 15.0, 30.0), '(DEFAULT_CFG)')
+chk('没配节奏项时用默认值', cpf.poll_plan({}) == (5.0, 15.0, 30.0))
+r = cpf.poll_plan(cfg)
+chk('部署 config 的节奏 = %.0f/%.0f/%.0f 秒' % r, r[1] >= 10.0,
+    'EC 读间隔应 >= 10 秒(降频确实生效)')
+chk('开机前 5 分钟自动加密(EC<=5 秒)', cpf.poll_plan(cfg, fast=True)[1] <= 5.0)
+gp = cpf.poll_plan(cfg, guard=True)
+chk('保护生效: EC 读提到跟主循环同频', gp[1] == gp[0], '%s' % (gp,))
+hp = cpf.poll_plan(cfg, hot=True)
+chk('温度 > flag_hot_c: 标志跟 EC 同频', hp[2] == hp[1], '%s' % (hp,))
+chk('乱填 0/负数也不会变成疯读',
+    min(cpf.poll_plan({'poll_s': 0, 'ec_poll_s': -1, 'flag_poll_s': 0})) >= 1.0)
+chk('flag_hot_c 读得到(默认 85)', abs(cpf.flag_hot_c({}) - 85.0) < 0.01)
+import inspect
+chk('tick 支持 ec/read_flags: %s' % str(inspect.signature(cpf.tick)),
+    'ec' in str(inspect.signature(cpf.tick)) and 'read_flags' in str(inspect.signature(cpf.tick)))
+
+print('=== 标志缓存不当新证据(flags_fresh=False) ===')
+cpf._G['level'] = None
+cpf._G['trip_hits'] = 0
+cpf.guard_apply(cfg, 60, None, {0x8A: 1})                        # 真读第 1 轮
+cpf.guard_apply(cfg, 60, None, {0x8A: 1}, flags_fresh=False)     # 缓存轮
+cpf.guard_apply(cfg, 60, None, {0x8A: 1}, flags_fresh=False)     # 缓存轮
+chk('缓存值反复传不会自己凑成"连续两轮"', cpf._G['level'] is None,
+    'trip_hits=%s level=%s' % (cpf._G.get('trip_hits'), cpf._G['level']))
+chk('第 2 次真读才确认', '固件标志' in (cpf.guard_apply(cfg, 60, None, {0x8A: 1}) or ''))
+cpf._G['level'] = None
+cpf._G['trip_hits'] = 0
+cpf.set_pl_override(None)
+
 print()
 print('失败项: %d' % len(FAIL))
 for f in FAIL:

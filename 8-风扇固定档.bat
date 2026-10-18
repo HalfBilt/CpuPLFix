@@ -12,7 +12,8 @@ if not exist "%~dp0runtime\python.exe" (
   echo [X] runtime not found. Please run 1-install.bat first.
   pause
   exit /b 1
-)set LV=1
+)
+set LV=1
 set /p LV=Level (1-7 quiet..loud, 64 = full speed): 
 "%~dp0runtime\python.exe" "%~dp0CpuPLFix.py" fan level %LV%
 echo.
