@@ -63,11 +63,13 @@ cpf.set_pl_override(None)
 
 print('=== fan_level_of: 升降档与回差 ===')
 curve = cpf.fan_cfg(cfg)['curve']
+hyst = float(cpf.fan_cfg(cfg)['hyst'])
+print('  曲线 %s   回差 %g°C' % (curve, hyst))
 prev = None
-seq = [(40, 1), (55, 2), (58, 4), (59, 4), (57, 4), (56.5, 4), (56.4, 2), (56, 2),
-       (50, 2), (49, 2), (48.5, 2), (48.4, 1)]
+seq = [(40, 2), (60, 2), (62, 2), (63, 6), (70, 6), (75, 6), (76, 64), (80, 64),
+       (71, 64), (70, 6), (62, 6), (58, 6), (57, 2), (55, 2), (50, 2)]
 for t, want in seq:
-    lv, idx = cpf.fan_level_of(t, curve, prev)
+    lv, idx = cpf.fan_level_of(t, curve, prev, hyst)
     prev = idx
     ok = (lv == want)
     print('    [%s] %5s°C -> 档位 %-3s (段 %d)   期望 %s'

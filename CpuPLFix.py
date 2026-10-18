@@ -87,8 +87,9 @@ DEFAULT_CFG = {
     "fan": {
         "mode": "curve",        # curve = 按温度曲线自动 / max = 满速 / off = 交还 EC 自动 / level = 固定档
         "level": 0,             # mode=level 时用: 1~7 是 EC 固定档, 64 是满速
-        "curve": [[50, 1], [58, 2], [66, 4], [74, 6], [82, 7], [999, 64]],
-        "hyst": 1.5             # 降档回差(°C), 防止温度在档位边界来回抖
+        # 三档: ≤62°C 静音(2 档) / 63~75°C 平衡(6 档) / ≥76°C 强冷(满速)  —— 见 说明.txt
+        "curve": [[63, 2], [76, 6], [999, 64]],
+        "hyst": 5.0             # 降档回差(°C), 防止温度在档位边界来回抖
     },
     # ---- 过热保护: 防止跑到固件的 _HOT 阈值被强制休眠 ----
     "guard": {
@@ -773,7 +774,7 @@ def fan_cfg(cfg):
 _FAN = {'idx': None}
 
 
-def fan_level_of(temp, curve, prev_idx=None, hyst=1.5):
+def fan_level_of(temp, curve, prev_idx=None, hyst=5.0):
     """按温度曲线取 (档位, 段号)。curve 是 [[温度上限, 档位], ...] 从低到高。
 
     升温立即升档; 降温要低过"当前这一段的**下边界** - 回差"才降。
@@ -810,7 +811,7 @@ def fan_tick(cfg, temp=None, force_max=False):
     else:
         if temp is None:
             return None
-        want, idx = fan_level_of(temp, f['curve'], _FAN['idx'], float(f.get('hyst') or 1.5))
+        want, idx = fan_level_of(temp, f['curve'], _FAN['idx'], float(f.get('hyst') or 5.0))
     cur = ec_hfsp()
     if cur is None:
         return None
