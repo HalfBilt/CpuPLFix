@@ -52,13 +52,14 @@ SVC = 'TSCtl'
 SVC_TOOL = 'CpuPLFixSvc'
 TASK_NAME = 'CpuPLFix'
 BOOT_WATCH_SEC = 300         # 开机/唤醒后看守多久(秒)
+LOG_MAX_BYTES = 2 * 1024 * 1024   # 日志超过 2MB 就滚动成 fix.log.1(只留一份)
 MIN_PL_W = 5.0               # 手动指定功耗墙时的安全下限, 低于它机器会慢到没法用
 MCHBAR_REG = 0x48
 MMIO_PL_OFF = 0x59A0
 MSR_PKG_POWER_LIMIT = 0x610
 MSR_PERF_STATUS = 0x198
 
-# ThrottleStop 驱动的 IOCTL 码(由驱动分发表逆向得到, 见 README)
+# ThrottleStop 驱动的 IOCTL 码(由驱动分发表逆向得到)
 IOCTL_VERSION = 0x80006494
 IOCTL_RDMSR = 0x80006448
 IOCTL_WRMSR = 0x8000644C
@@ -87,7 +88,7 @@ DEFAULT_CFG = {
     "fan": {
         "mode": "curve",        # curve = 按温度曲线自动 / max = 满速 / off = 交还 EC 自动 / level = 固定档
         "level": 0,             # mode=level 时用: 1~7 是 EC 固定档, 64 是满速
-        # 三档: ≤62°C 静音(2 档) / 63~75°C 平衡(6 档) / ≥76°C 强冷(满速)  —— 见 说明.txt
+        # 三档: ≤62°C 静音(2 档) / 63~75°C 平衡(6 档) / ≥76°C 强冷(满速)
         "curve": [[63, 2], [76, 6], [999, 64]],
         "hyst": 5.0             # 降档回差(°C), 防止温度在档位边界来回抖
     },
@@ -112,7 +113,7 @@ DEFAULT_CFG = {
         "trip_flags": True,     # EC 0x89/0x8A/0x8B 一置位就是最高级(固件真判据)
         "escape_hibernate": False
     },
-    "comment": "pl1_w/pl2_w = 插电(高性能)档, pl1_w_batt/pl2_w_batt = 电池(平衡)档。mmio_mode: disable = MMIO清零+锁后只写MSR(免重启切档, 实测本机MSR可写时推荐); value = 写目标值进MMIO+锁(老方案, 改配置要重启)。poll_s/ec_poll_s/flag_poll_s = 主循环/EC读/固件标志读的间隔秒数(EC 是慢总线, 默认 15/30 秒)。fan = 风扇模式/温度曲线; guard = 过热保护阈值(原因见 说明.txt: 本机 _TZ.THM0 _HOT=401K 会强制休眠)。"
+    "comment": "pl1_w/pl2_w = 插电(高性能)档, pl1_w_batt/pl2_w_batt = 电池(平衡)档。mmio_mode: disable = MMIO清零+锁后只写MSR(免重启切档, 实测本机MSR可写时推荐); value = 写目标值进MMIO+锁(老方案, 改配置要重启)。poll_s/ec_poll_s/flag_poll_s = 主循环/EC读/固件标志读的间隔秒数(EC 是慢总线, 默认 15/30 秒)。fan = 风扇模式/温度曲线; guard = 过热保护阈值(本机 _TZ.THM0 _HOT=401K 会强制休眠, 所以要这条线)。"
 }
 
 k32 = ctypes.WinDLL('kernel32', use_last_error=True)
@@ -135,6 +136,69 @@ def uptime():
         return -1.0
 
 
+def unbiased_uptime():
+    """系统"清醒"运行秒数(不含睡眠) —— QueryUnbiasedInterruptTime 的官方口径。
+
+    GetTickCount64 在睡眠期间到底走不走, 各 Windows 版本/机型不一致, 所以只靠它
+    分不清"睡醒"和"计划任务 5 分钟一次的重复"。拿不到这个 API 就返回 None。
+    """
+    try:
+        v = ctypes.c_ulonglong(0)
+        if not k32.QueryUnbiasedInterruptTime(ctypes.byref(v)):
+            return None
+        return v.value / 1e7
+    except Exception:
+        return None
+
+
+BOOT_STATE = os.path.join(LOG_DIR, 'boot_last.txt')   # 上一次 boot 时的 (墙钟, 清醒秒)
+
+
+def boot_trigger(up):
+    """判断这次 cmd_boot 是被哪种情况叫起来的 -> (标签, 是否"安静运行")。
+
+    计划任务在开机后 30 分钟内会每 5 分钟重复叫一次，同一个入口也服务"睡醒"，
+    所以必须分清：'开机' / '开机后复查' / '睡眠/休眠唤醒后' / '定时复查'。
+    判据: 两次运行之间"墙钟走的秒数 − 清醒走的秒数" ≈ 睡掉的秒数
+          （清醒秒数用 QueryUnbiasedInterruptTime，官方口径不含睡眠）。
+
+    每次调用都会把 (墙钟, 清醒秒) 落到 BOOT_STATE —— 包括开机那次，
+    否则开机后的第一个"5 分钟重复"会拿到上一次开机的旧值，判不准。
+    返回的 quiet=True 表示"重复触发且没睡过" —— 这种没事就不用往日志里刷两行。
+    """
+    now_w, now_u = time.time(), unbiased_uptime()
+    last_w = last_u = None
+    try:
+        with open(BOOT_STATE, encoding='utf-8') as f:
+            last_w, last_u = [float(x) for x in f.read().split()]
+    except Exception:
+        pass
+    if now_u is not None:
+        try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            with open(BOOT_STATE, 'w', encoding='utf-8') as f:
+                f.write('%.3f %.3f' % (now_w, now_u))
+        except Exception:
+            pass
+
+    tag, quiet = ('开机' if up < 600 else '唤醒/复查'), False
+    if last_w is not None and now_u is not None and last_u is not None:
+        d_u = now_u - last_u
+        # QueryUnbiasedInterruptTime 只有 ~15 ms 粒度, 两次挨得很近时 d_u 可能是负的,
+        # 所以允许一点负抖动; 真正重启会让 d_u 变成很大的负数(那时 up 也 < 600)。
+        if d_u > -2.0:
+            slept = (now_w - last_w) - max(0.0, d_u)
+            if slept > 60:                      # 真睡过
+                tag = '睡眠/休眠唤醒后, 睡掉 %.0f 秒' % slept
+            elif up < 600:                      # 开机后计划任务的 5 分钟重复
+                tag, quiet = '开机后复查', True
+            else:
+                tag, quiet = '定时复查', True
+    return tag, quiet
+
+
+_no_log = False          # True = 只打屏幕、不进日志缓冲（体检的输出太啰嗦，不该灌进 fix.log）
+
 _lines = []
 
 
@@ -144,7 +208,55 @@ def out(msg=''):
             print(msg)
     except Exception:
         pass
-    _lines.append(msg)
+    if not _no_log:
+        _lines.append(msg)
+
+
+def _log_line(text, tag='check'):
+    """直接往 fix.log 追加一条记录（绕过 _lines 缓冲）。
+    给那些"只上屏幕"的命令留个痕迹 —— 否则日志里完全看不出你什么时候体检过。"""
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        p = os.path.join(LOG_DIR, 'fix.log')
+        _rotate_log(p)
+        with open(p, 'a', encoding='utf-8') as f:
+            f.write('\n===== %s %s =====\n%s\n'
+                    % (datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), tag, text))
+    except Exception:
+        pass
+
+
+def _rotate_log(p):
+    """fix.log 超过 LOG_MAX_BYTES 就改名成 fix.log.1(旧的覆盖掉), 免得无限变大。
+    服务/watcher/bat 可能同时写同一个文件, 所以用 .lock 做互斥; 任何失败都只是
+    这轮不滚, 不影响写日志本身。"""
+    try:
+        if os.path.getsize(p) < LOG_MAX_BYTES:
+            return
+    except OSError:
+        return
+    lock = p + '.lock'
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+    except OSError:
+        # 拿到锁的进程正在滚; 万一是上次崩溃留下的僵尸锁, 超过 60 秒就清掉
+        try:
+            if time.time() - os.path.getmtime(lock) > 60:
+                os.remove(lock)
+        except OSError:
+            pass
+        return
+    try:
+        if os.path.getsize(p) >= LOG_MAX_BYTES:   # 拿锁后复查, 别人可能刚滚过
+            os.replace(p, p + '.1')
+    except OSError:
+        pass
+    finally:
+        try:
+            os.remove(lock)
+        except OSError:
+            pass
 
 
 def flush_log(tag='run'):
@@ -154,6 +266,7 @@ def flush_log(tag='run'):
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
         p = os.path.join(LOG_DIR, 'fix.log')
+        _rotate_log(p)
         with open(p, 'a', encoding='utf-8') as f:
             f.write('\n===== %s %s =====\n' % (datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), tag))
             f.write('\n'.join(_lines) + '\n')
@@ -548,7 +661,9 @@ def save_cfg(cfg):
 IOCTL_READ_PORT = 0x80006430
 IOCTL_WRITE_PORT = 0x80006434
 EC_CTRL, EC_DATA = 0x66, 0x62
-EC_HFSP, EC_TEMP, EC_FANSW, EC_RPM_LO, EC_RPM_HI = 0x2F, 0x78, 0x31, 0x84, 0x85
+EC_HFSP, EC_TEMP, EC_RPM_LO, EC_RPM_HI = 0x2F, 0x78, 0x84, 0x85
+EC_FSEL_LEGACY = 0x31      # 老 IBM/X60 那代用它选"主/副风扇"(bit0); 本机不是, 见 ec_rpm()
+EC_TEMP_EXTRA = (0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0xC9)   # TTS1/TTS6/TTS2/TTS3/TTS4/HWAT
 FAN_AUTO, FAN_MAX = 0x80, 0x40
 FAN_LEVEL_RPM = {1: 2480, 2: 2610, 3: 2720, 4: 3190, 5: 3185, 6: 3490, 7: 3880, 64: 5000}
 
@@ -557,6 +672,8 @@ FAN_LEVEL_RPM = {1: 2480, 2: 2610, 3: 2720, 4: 3190, 5: 3185, 6: 3490, 7: 3880, 
 #   于是固件/系统判定热区到顶, 强制休眠(S4)。
 #   注意: 它跟温度寄存器 0x78 的读数无关 —— 0x78 只是给 OS 看的温度(而且 0x80 是
 #   "无效"哨兵值, AML 会把它当成 48°C)。2026-10-18 那次强制休眠就是这几个标志触发的。
+#   ⚠️ 只有这三个! 0x88(TSL0/TSR0) **不**参与 _TMP 的判据(它只被 _WAK/_Q40 用来挑热表),
+#      2026-10-18 实测本机 0x88 常驻 0x40(bit6), 属正常, 别当成"过热"。
 EC_TRIP_FLAGS = (0x89, 0x8A, 0x8B)
 EC_TEMP_SENTINEL = 0x80        # 0x78 读到这个值 = 传感器给了无效码
 
@@ -739,12 +856,48 @@ def ec_tripped(flags):
 
 
 def ec_rpm():
-    """风扇转速。读之前先往 FANSW 写 0 触发一次刷新"""
-    ec_write(EC_FANSW, 0)
-    lo, hi = ec_read(EC_RPM_LO), ec_read(EC_RPM_HI)
+    """风扇转速。先读 0x84 再读 0x85 —— 顺序不能反(thinkpad_acpi 记载的固件 bug)。
+
+    2026-10-18 实测: **不需要**先写 0x31。
+      · 本机 DSDT 里 0x31 的位叫 HUWB(bit2)/VPON(bit6)/VRST(bit7), bit0/1 是保留位;
+        "写 0x31=0 选主风扇" 是老 IBM / X60 那代(固件 TP-7M)的做法, 抄过来是错的。
+      · 本机 0x31 实测常驻 0x00, 而且"写"和"不写"读到的转速完全一样(3888/3889 RPM)。
+      · 原来每次读转速都多写一次 EC —— 那三个位语义没确认, 少碰为好。
+    只有"两次读都失败"时才退回老做法试一次(兼容别的机型)。
+    """
+    locked = _ec_lock()
+    try:
+        lo = ec_read(EC_RPM_LO, _locked=True)
+        hi = ec_read(EC_RPM_HI, _locked=True)
+        if lo is None or hi is None:
+            ec_write(EC_FSEL_LEGACY, 0, _locked=True)     # 兜底: 别的机型可能要选一下
+            lo = ec_read(EC_RPM_LO, _locked=True)
+            hi = ec_read(EC_RPM_HI, _locked=True)
+    finally:
+        _ec_unlock(locked)
     if lo is None or hi is None:
         return None
     return (hi << 8) | lo
+
+
+def ec_extra_temps():
+    """本机 EC 里另外几个温度寄存器(不给保护逻辑用, 只看)。
+
+    来源: DSDT 的 EC Field 名 —— 0x7A TTS1 / 0x7B TTS6 / 0x7C TTS2 / 0x7D TTS3 /
+    0x7E TTS4 / 0xC9 HWAT。0x79 是 GPU 温度(本机无独显 = 0x80)。
+
+    实测(2026-10-18):
+      · TTS3/TTS4 跟负载动, 但比 0x78 慢得多(空闲 59/54, 满载 73/64; 同期 0x78 是 59→85)。
+        所以它们**不是**"最热的那个", 只是另一组传感器(大概靠主板/风道)。
+      · 0xC9 HWAT 在"空闲"和"满载"两个差很大的状态下**都恰好 65** → 它不是温度读数,
+        是个常量(含义还没解出来), 别当温度用。
+    """
+    d = {}
+    for off in EC_TEMP_EXTRA:
+        v = ec_read_ok(off)
+        if v is not None and 0 <= v <= 127:
+            d[off] = v
+    return d
 
 
 def set_fan(v):
@@ -1086,8 +1239,11 @@ def poll_plan(cfg, fast=False, guard=False, hot=False):
 
 # ---------------------------------------------------------------- 命令
 def cmd_check():
+    global _no_log
+    _no_log = True      # 体检输出只上屏幕、不进 fix.log（以前每跑一次就往日志里灌一整屏）
     if not ensure_driver():
         out('[X] 驱动加载失败, 无法访问硬件寄存器')
+        _log_line('[X] 手动体检: 驱动加载失败')
         return 1
     out('驱动版本: %s' % struct.unpack('<I', ioctl(IOCTL_VERSION, b'', 4)[1][:4])[0])
 
@@ -1148,8 +1304,21 @@ def cmd_check():
     tv = cpf_read_thermal()
     if tv:
         if tv['temp'] >= 90:
-            out('CPU 温度           : %d °C  [!] 接近/达到 TjMax — 这是温度墙限频, 和功耗墙无关' % tv['temp'])
-            out('                     (治本: 清灰换硅脂; 或把 pl1_w 降到 35~40)')
+            # 实测教训(2026-10-18 23:12): 同一时刻 DTS=95°C, 而倍频还有 4.30GHz、EC 0x78 只有 85°C。
+            # DTS 是"TjMax 减读数"的估算口径, 满载会失真 —— 光看它就喊"温度墙限频"会误导。
+            # 所以这里要结合倍频一起判。
+            ecs = ec_temp()
+            if ratio <= 20:
+                out('CPU 温度           : %d °C  [!] 高, 且倍频只有 %.1fGHz —— 像被温度墙压住了'
+                    % (tv['temp'], ratio / 10.0))
+                out('                     (治本: 清灰换硅脂; 或把 pl1_w 降到 35~40)')
+            else:
+                out('CPU 温度           : %d °C  (DTS 口径; 但倍频 %.1fGHz 正常 → 多半只是满载失真, 没被限住)'
+                    % (tv['temp'], ratio / 10.0))
+                if ecs is not None:
+                    out('%s %d °C  ← 过热保护看的是这个 (预警 %.0f°C)'
+                        % (_pad('EC 温度 (0x78)', 26), ecs, guard_cfg(cfg)['warn_c']))
+                    out('                     注: 本机满载时 DTS 比 EC 0x78 高约 10°C, 两个刻度别混着看')
         else:
             out('CPU 温度           : %d °C  (TjMax=%d, 公式 TjMax-DTS; 仅空闲可信, 满载会失真)'
                 % (tv['temp'], tv['tjmax']))
@@ -1159,6 +1328,8 @@ def cmd_check():
     # ---- 风扇 / 过热保护 ----
     out('')
     out('%-26s %s' % ('', '风扇 / 过热保护'))
+    cur = t = r = None
+    fl, hit = {}, []
     try:
         f = fan_cfg(cfg)
         g = guard_cfg(cfg)
@@ -1171,6 +1342,13 @@ def cmd_check():
                        ('%s (0x%02X)' % (fan_name(cur), cur)) if cur is not None else '读取失败'))
         out('%s %s' % (_pad('风扇转速', 26), ('%d RPM' % r) if r is not None else '读取失败'))
         out('%s %s' % (_pad('EC 温度 (0x78)', 26), ('%d °C' % t) if t is not None else '读取失败'))
+        et = ec_extra_temps()
+        if et:
+            out('%s %s' % (_pad('其它 EC 温度', 26),
+                           '  '.join('%s=0x%02X/%d°C' % ({0x7A: 'TTS1', 0x7B: 'TTS6', 0x7C: 'TTS2',
+                                                          0x7D: 'TTS3', 0x7E: 'TTS4', 0xC9: 'HWAT'}.get(k, '?'),
+                                                         k, v) for k, v in sorted(et.items()))
+                           + '   (另一组传感器, 只记录, 不参与逻辑)'))
         out('%s %s' % (_pad('固件过热标志', 26),
                        flags_desc(fl) + ('   [!] 已置位(固件正在报 _HOT)' if hit else '   (正常)')
                        if fl else '读取失败'))
@@ -1202,6 +1380,21 @@ def cmd_check():
         s = '未安装  [!] 只有计划任务在管'
     out('%s %s' % (_pad('看守服务 CpuPLFixSvc', 26), s))
     out('%s %s' % (_pad('日志最近一次记录', 26), _last_log_head()))
+
+    # ---- 给日志留一行摘要（体检本身只上屏幕）----
+    try:
+        _log_line('[*] 手动体检: %s  MSR PL1=%s PL2=%s  倍频 %d  EC温度 %s  DTS %s  风扇 %s %s  固件标志 %s'
+                  % ('AC' if on_ac() else '电池',
+                     ('%.2fW' % d_m['pl1_w']) if d_m else '?',
+                     ('%.2fW' % d_m['pl2_w']) if d_m else '?',
+                     ratio,
+                     ('%d°C' % t) if t is not None else '--',
+                     ('%d°C' % tv['temp']) if tv else '--',
+                     fan_name(cur),
+                     ('%dRPM' % r) if r is not None else '--',
+                     flags_desc(fl) if fl else '--'))
+    except Exception:
+        pass
     return 0
 
 
@@ -1782,16 +1975,16 @@ def cmd_boot():
     """开机 / 唤醒后尽早执行。已经健康就直接退出, 不健康才修复并进看守。"""
     t_start = time.time()
     up = uptime()
-    # 同一个入口既服务"开机"也服务"睡眠/休眠唤醒"(计划任务的三种触发器都调它),
-    # 靠系统运行时长区分, 方便事后看日志判断这次到底是哪种情况。
+    # 同一个入口既服务"开机"、也服务"睡眠/休眠唤醒"、还会被计划任务在开机后 30 分钟内
+    # 每 5 分钟重复叫一次。光看 uptime 区分不了后两者 —— 以前全被记成"睡眠/休眠唤醒后",
+    # 日志里就会出现"刚开机 20 分钟却说刚睡醒"的假记录。现在用 boot_trigger() 实测有没有睡。
     if up < 0:
-        tag = '触发'
-    elif up < 600:
-        tag = '开机'
+        tag, quiet = '触发', False
     else:
-        tag = '睡眠/休眠唤醒后'
-    out('[*] 进程启动(%s): 系统已运行 %.1f 秒, 解释器启动耗时 %.2f 秒'
-        % (tag, up, t_start - _T_IMPORT))
+        tag, quiet = boot_trigger(up)     # quiet = 重复触发且没睡过 -> 没事只记一行
+    if not quiet:
+        out('[*] 进程启动(%s): 系统已运行 %.1f 秒, 解释器启动耗时 %.2f 秒'
+            % (tag, up, t_start - _T_IMPORT))
 
     cfg = load_cfg()
     if not ensure_driver(verbose=True):
@@ -1829,10 +2022,15 @@ def cmd_boot():
     if healthy:
         for n in tick(cfg):             # 功耗墙已健康, 但风扇还得按曲线走
             out('[*] %s' % n)
+        if quiet:
+            out('[*] 定时复查: 状态正常, 无需修复 (已运行 %.0f 秒, 倍频 %d)'
+                % (uptime(), (rdmsr(MSR_PERF_STATUS) or 0) >> 8 & 0xFF))
         flush_log('boot')
         return 0
 
     # ---- 需要修复 ----
+    if quiet:                            # 正常复查不刷"进程启动", 出事时才补上现场
+        out('[*] 进程启动(%s): 系统已运行 %.1f 秒' % (tag, uptime()))
     out('[*] 需要修复, 开始执行 (系统已运行 %.1f 秒)' % uptime())
     try:
         cmd_fix(quiet=True)
@@ -1974,8 +2172,9 @@ def cmd_fan(args):
         tips = {'curve': '按温度自动(见 fan.curve)', 'max': '固定满速',
                 'auto': '交还 EC 原生自动(本机原生曲线偏平, 到不了满速)'}
         out('[√] 风扇模式 -> %s (%s)' % (mapped[a], tips.get(a, '')))
+        rpm = ec_rpm()                      # 只读一次(原来这里 ec_rpm() 被调了两遍)
         out('    现在: %s, %s' % (fan_name(ec_hfsp()),
-                                  ('%d RPM' % ec_rpm()) if ec_rpm() is not None else ''))
+                                  ('%d RPM' % rpm) if rpm is not None else ''))
         return 0
     out('用法: CpuPLFix.py fan [状态|curve|max|auto|level N]')
     return 2
