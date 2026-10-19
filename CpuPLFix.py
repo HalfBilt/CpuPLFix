@@ -843,7 +843,7 @@ def ec_read_ok(off, tries=3):
 #   2) 自适应等待: 检出串位就把"写完偏移后的等待"翻倍(上限 20ms), 连续 20 次干净再退回去;
 #   3) 计数: 串位/事务数攒起来, 每 120 次事务报一行, 回头看工程机的总线到底有多糟。
 EC_CANARY = (0xC9, 65)          # (偏移, 期望值): HWAT, 本机常量
-_ECBUS = {'ok': 0, 'bad': 0, 'settle': 0.003, 'clean': 0, 'pending': False}
+_ECBUS = {'ok': 0, 'bad': 0, 'retry': 0, 'settle': 0.003, 'clean': 0, 'pending': False}
 ECBUS_REPORT_EVERY = 120
 
 
@@ -852,8 +852,19 @@ def ec_bus_settle():
     return _ECBUS['settle']
 
 
-def ec_bus_stat(hit_bad):
-    """记一次事务结果 + 自适应等待; 攒够了置 pending(由 ec_bus_report 取走)。"""
+def ec_bus_stat(hit_bad, retry=False):
+    """记一次事务结果 + 自适应等待; 攒够了置 pending(由 ec_bus_report 取走)。
+
+    hit_bad=True  = 哨兵不符/读不出 —— 确定的总线问题, 加大等待;
+    retry=True    = 哨兵对但两次读出的值不同 —— 温度/转速这类**本来就该变**的寄存器
+                    也会这样, 只计数、不动等待(2026-10-19 修正: 早先把两者混在一起,
+                    报出过 24.4% 的虚高串位率)。
+    """
+    if retry and not hit_bad:
+        _ECBUS['retry'] += 1
+        _ECBUS['ok'] += 1
+        _ECBUS['clean'] += 1
+        return
     if hit_bad:
         _ECBUS['bad'] += 1
         _ECBUS['clean'] = 0
@@ -868,22 +879,24 @@ def ec_bus_stat(hit_bad):
 
 
 def ec_bus_stats():
-    """(事务数, 串位数, 等待毫秒) —— 给 2-check 显示。"""
-    return _ECBUS['ok'] + _ECBUS['bad'], _ECBUS['bad'], _ECBUS['settle'] * 1000.0
+    """(事务数, 串位数, 等待毫秒, 值变动重读数) —— 给 2-check 显示。"""
+    return (_ECBUS['ok'] + _ECBUS['bad'], _ECBUS['bad'], _ECBUS['settle'] * 1000.0,
+            _ECBUS['retry'])
 
 
 def ec_bus_report():
     """攒够事务数且出过串位就返回一行; 否则 None(并把窗口清零)。"""
     if not _ECBUS['pending']:
         return None
-    n_ok, n_bad = _ECBUS['ok'], _ECBUS['bad']
-    _ECBUS['ok'] = _ECBUS['bad'] = 0
+    n_ok, n_bad, n_re = _ECBUS['ok'], _ECBUS['bad'], _ECBUS['retry']
+    _ECBUS['ok'] = _ECBUS['bad'] = _ECBUS['retry'] = 0
     _ECBUS['pending'] = False
-    if not n_bad:
+    if not n_bad and not n_re:
         return None
-    return ('EC 总线体检: 最近 %d 次事务里 %d 次串位(%.1f%%), 等待已自适应到 %.1f ms '
-            '—— 工程机 + 系统 ACPI EC 驱动抢端口, 属已知现象(见 03 §4), 可疑读数已被丢弃'
-            % (n_ok + n_bad, n_bad, 100.0 * n_bad / max(1, n_ok + n_bad), _ECBUS['settle'] * 1000.0))
+    return ('EC 总线体检: 最近 %d 次事务 —— 串位 %d 次(%.1f%%) / 值变动重读 %d 次, 等待 %.1f ms '
+            '—— 工程机 + 系统 ACPI EC 驱动抢端口(见 03 §4); 关键读已用哨兵挡住'
+            % (n_ok + n_bad, n_bad, 100.0 * n_bad / max(1, n_ok + n_bad), n_re,
+               _ECBUS['settle'] * 1000.0))
 
 
 def ec_read_strict(off, tries=3):
@@ -908,9 +921,9 @@ def ec_read_strict(off, tries=3):
         if prev is not None and v == prev:
             ec_bus_stat(False)
             return v
-        # 哨兵对、但两次读出来的值不一样 —— 也是串位(实测就是这么表现的: 读 0x8B 一次拿到
-        # 0x3B(那一刻的温度值)、下一次才对)。按异常计数 + 加大等待, 再来一遍。
-        ec_bus_stat(prev is not None)
+        # 哨兵对、但两次读出来的值不一样: 对动态寄存器(温度/转速)属正常, 只记一次"重试";
+        # 对关键读(会用这个值去动手的)仍然要求两次一致才返回 —— 所以这里照样再来一遍。
+        ec_bus_stat(False, retry=(prev is not None))
         prev = v
     return None
 
@@ -1351,6 +1364,29 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
             % (et, g['warn_c'], g['warn_pl1_w'], g['warn_pl2_w']))
 
 
+def thermal_hib_info(minutes=20):
+    """查系统日志里最近有没有 Kernel-Power 事件 88(严重热事件 -> 固件强制休眠)。
+
+    2026-10-19 11:29:42 实测: EC 0x78 只有 58°C、DTS 58°C、负载 14%, 而固件热区
+    \\_TZ.THM0 还是报了 _HOT -> ACPI 直接休眠(S4)。人看到的是"毫无征兆直接关机",
+    其实会话被落盘了、开机后程序都还在。这条只在"刚开机/刚唤醒"时调一次(起个 powershell,
+    ~1 秒), 让日志里留一句人话。
+    """
+    try:
+        import subprocess
+        ps = ('[Console]::OutputEncoding=[Text.Encoding]::UTF8;'
+              '$ErrorActionPreference="SilentlyContinue";'
+              'Get-WinEvent -FilterHashtable @{LogName="System";Id=88;'
+              'StartTime=(Get-Date).AddMinutes(-%d)} -MaxEvents 1 -ErrorAction SilentlyContinue |'
+              'ForEach-Object { $_.TimeCreated.ToString("MM-dd HH:mm:ss") }' % int(minutes))
+        r = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', ps],
+                           capture_output=True, timeout=25)
+        s = (r.stdout or b'').decode('utf-8', 'replace').strip()
+        return s or None
+    except Exception:
+        return None
+
+
 def do_hibernate():
     """主动优雅休眠(S4): 落盘后断电, 醒来会话还在 —— 比固件的强制断电温和"""
     out('[*] 过热保护: 立即主动休眠')
@@ -1685,9 +1721,9 @@ def cmd_check():
             out('%s %.1f%%   (风扇负载前馈: >=%.0f%% 满 %.0f 秒 -> %d 档)'
                 % (_pad('CPU 占用', 26), _l2, _lb.get('load_boost_pct', 70.0),
                    _lb.get('load_boost_s', 20.0), _lb.get('load_boost_level', 64)))
-        _n, _b, _ms = ec_bus_stats()
-        out('%s 本进程事务 %d 次 / 串位 %d 次, 当前自适应等待 %.1f ms'
-            % (_pad('EC 总线', 26), _n, _b, _ms))
+        _n, _b, _ms, _re = ec_bus_stats()
+        out('%s 本进程事务 %d 次 / 串位 %d 次 / 值变动重读 %d 次, 当前自适应等待 %.1f ms'
+            % (_pad('EC 总线', 26), _n, _b, _re, _ms))
         out('%s %s' % (_pad('风扇模式', 26), '%s   (config.json -> fan.mode)' % f.get('mode')))
         if str(f.get('mode')).lower() == 'curve':
             out('%s %s' % (_pad('温度曲线', 26),
@@ -2422,6 +2458,12 @@ def cmd_boot():
             % (tag, up, t_start - _T_IMPORT))
 
     cfg = load_cfg()
+    # ★刚开机/刚唤醒: 查一下上一次是不是"固件热事件"强制休眠(Event 88), 留一句人话
+    if tag.startswith('开机') or '唤醒' in tag:
+        th = thermal_hib_info()
+        if th:
+            out('[*] 注意: 上一次是**固件热事件强制休眠**(Kernel-Power 88, %s) —— 不是掉电, '
+                '会话已落盘、程序都还在; 固件热区 _TZ.THM0 报 _HOT 就会这样(手册 02 §3.2)' % th)
     if not ensure_driver(verbose=True):
         out('[X] 驱动加载失败 (系统已运行 %.1f 秒)' % uptime())
         flush_log('boot')
