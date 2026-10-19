@@ -1497,6 +1497,13 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
         _G['step'] = step
         p1 = float((g.get('crit_pl1_w') if step == 1 else g.get('crit%d_pl1_w' % step)) or 28.0)
         p2 = float((g.get('crit_pl2_w') if step == 1 else g.get('crit%d_pl2_w' % step)) or 35.0)
+        # ★2026-10-19 实测发现: 固件标志挂着时, "温度也高"走第一级(28/35)反而比"标志降温档"
+        #   (20/28)更松 —— 于是 EC 在 95°C 上下一点来回, 就 28/35 ↔ 20/28 反复切。
+        #   规则: 标志触发时不许比标志档更松(取更严的那个); 阶梯仍可在它之下继续加深。
+        clamp = _G.get('why') == '固件标志'
+        if clamp:
+            p1 = min(p1, float(g.get('flag_pl1_w') or 20.0))
+            p2 = min(p2, float(g.get('flag_pl2_w') or 28.0))
         set_pl_override(p1, p2)
         tag = {1: '第一级', 2: '第二级', 3: '地板'}[step]
         nice = {1: 'PBP 28W 档', 2: 'Minimum Assured Power 20W 档',
@@ -1507,8 +1514,10 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
                 return ('过热保护[固件标志]: EC %s —— 固件已把热区报成 _HOT(401K), '
                         '不等它强制断电, 立即主动休眠(S4)' % desc)
             return ('过热保护[固件标志]: EC %s 且温度也高(EC %d°C ≥ %.0f°C) —— 功耗墙压到 '
-                    '%s PL1=%.0fW/PL2=%.0fW, 风扇满速(已连续两轮确认)'
-                    % (desc, et, g['warn_c'], tag, p1, p2))
+                    '%s PL1=%.0fW/PL2=%.0fW(不比标志降温档%.0f/%.0fW 更松), 风扇满速'
+                    '(已连续两轮确认)'
+                    % (desc, et, g['warn_c'], tag, p1, p2,
+                       float(g.get('flag_pl1_w') or 20.0), float(g.get('flag_pl2_w') or 28.0)))
         if et is None:
             return ('过热保护[严重·%s]: EC 温度读不到, 用 CPU DTS %d°C 兜底 —— 功耗墙压到 '
                     'PL1=%.0fW/PL2=%.0fW, 风扇满速' % (tag, dts, p1, p2))
