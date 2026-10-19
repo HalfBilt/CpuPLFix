@@ -1437,6 +1437,7 @@ def fan_tick(cfg, temp=None, force_max=False, load=None, force_why=None,
     f = fan_cfg(cfg)
     mode = str(f.get('mode') or 'curve').lower()
     boosted = False
+    dts_hot = False
     if temp is None:
         temp = ec_temp()
     idx = None
@@ -1467,7 +1468,17 @@ def fan_tick(cfg, temp=None, force_max=False, load=None, force_why=None,
         #   ② 负载前馈: 持续占用 >= load_boost_pct 满 load_boost_s 秒 -> 至少 load_boost_level
         #      (计时在 tick 里按 5 秒粒度做, 传进来的 boost 就是结论)。
         lvl = int(f.get('load_boost_level') or 0)
-        if dts is not None and dts >= float(f.get('dts_max_c') or 92.0) and want < FAN_MAX:
+        dts_max = float(f.get('dts_max_c') or 92.0)
+        hold_s = float(f.get('load_hold_s') or 30.0)
+        # ★2026-10-19: DTS 前馈加**保持时间**(和负载前馈同一个 load_hold_s)。
+        #   原来只要 DTS 一跌破阈值就立刻降回曲线档 —— DTS 读数本身有噪声(实测能抖好几度),
+        #   于是风扇会在"满速"和"曲线档"之间来回切(手册 06 §3.1 那个抖动的成因之一)。
+        #   现在: 到了阈值就置满速并保持 hold_s 秒, 期间不因为 DTS 回落而立刻降档。
+        if dts is not None and dts >= dts_max:
+            _FAN['dts_until'] = time.time() + hold_s
+        if _FAN.get('dts_until') and time.time() < _FAN['dts_until']:
+            dts_hot = True
+        if dts_hot and want < FAN_MAX:
             want, boosted = FAN_MAX, True
         elif boost and lvl > 0 and lvl > want:
             want, boosted = lvl, True
@@ -1524,13 +1535,22 @@ def fan_tick(cfg, temp=None, force_max=False, load=None, force_why=None,
     _FAN['lv'] = got
     if force_max and mode != 'max':
         why = ' (%s)' % (force_why or '过热保护')
-    elif boosted and dts is not None and dts >= float(f.get('dts_max_c') or 92.0):
-        why = ' (DTS 前馈 %d°C)' % dts
+    elif boosted and dts_hot:
+        why = ' (DTS 前馈 %d°C)' % (dts if dts is not None else 0)
     elif boosted:
         why = (' (负载前馈 %.0f%%)' % load) if load is not None else ' (负载前馈)'
     else:
         why = ' (%d°C)' % temp if (idx is not None and temp is not None) else ''
     why = why if isinstance(why, str) else ''   # 保险: 上面分支写错也不会让日志炸掉
+    if got != want and want != FAN_AUTO:
+        # ★2026-10-19: 写进去的目标档和回读对不上 —— 回读是**合法档位**, 所以上面那道
+        #   "不在合法档位里"的检查抓不到它。要么这一笔被串位了, 要么 EC 没接受这次写入。
+        #   两种都得让人看见: 否则日志里会出现"6 档 -> 6 档"这种看不懂的行
+        #   (实测 2026-10-19 20:40:04 就是这么来的 —— 下一轮重写就成功了)。
+        #   (交还 EC 自动(0x80) 除外 —— 那时 0x2F 由 EC 自己写, 回读当然不等于 0x80。)
+        return _note_once('fan_rb_mismatch_%02x_%02x' % (want, got),
+                          '风扇: %s -> %s%s  [已写 0x%02X 但回读是 0x%02X, 不是目标 —— '
+                          '下一轮会重写]' % (fan_name(cur), fan_name(got), why, want, got))
     return '风扇: %s -> %s%s' % (fan_name(cur), fan_name(got), why)
 
 
@@ -3259,7 +3279,11 @@ def cmd_fan(args):
         if a == 'max':
             set_fan(FAN_MAX)
         elif a == 'curve' and ec_temp() is not None:
-            fan_tick(cfg, ec_temp())          # 立即按曲线给一个档, 不用等下一轮
+            m = fan_tick(cfg, ec_temp())       # 立即按曲线给一个档, 不用等下一轮
+            if m:
+                # ★2026-10-19: 原来把 fan_tick() 的返回值丢掉了 —— 手动切档触发的写操作
+                #   不会进日志, 看起来像"0x2F 自己跳了档"。
+                out('    %s' % m)
         tips = {'curve': '按温度自动(见 fan.curve)', 'max': '固定满速',
                 'auto': '交还 EC 原生自动(本机原生曲线偏平, 到不了满速)'}
         out('[√] 风扇模式 -> %s (%s)' % (mapped[a], tips.get(a, '')))
