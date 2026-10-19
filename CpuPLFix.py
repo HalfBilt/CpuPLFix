@@ -3482,7 +3482,7 @@ def cmd_power():
     if th:
         out('  满载后核心温度: %d°C (节流标志=%d)' % (th['temp'], th['thermal_status']))
     out()
-    out('  怎么看: 若"满载平均"明显超过 PL1，说明功耗墙没压住（PL2 突发的 6 秒窗口也算进去）；')
+    out('  怎么看: 若"满载平均"明显超过 PL1，说明功耗墙没压住（PL2 突发的 5 秒窗口也算进去）；')
     out('        若峰值≈PL2 而平均≈PL1，说明功耗墙工作正常。')
     try:
         if sys.stdin and sys.stdin.isatty():
