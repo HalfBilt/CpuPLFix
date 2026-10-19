@@ -84,6 +84,8 @@ DEFAULT_CFG = {
     "poll_s": 5.0,               # 主循环间隔(秒)
     "ec_poll_s": 15.0,           # EC 读间隔(秒): 温度 + 风扇档位
     "flag_poll_s": 30.0,         # 固件过热标志(0x89/0x8A/0x8B)读间隔(秒)
+    # ★凉机(EC < flag_hot_c)且没在保护时, 标志读降到这个间隔 —— 少打扰 EC(工程机串位率 15~24%)
+    "flag_poll_slow_s": 120.0,
     # ---- 风扇(可选, 本机实测有效; 其他机型没有 EC 寄存器 0x2F 就自动跳过) ----
     "fan": {
         "mode": "curve",        # curve = 按温度曲线自动 / max = 满速 / off = 交还 EC 自动 / level = 固定档
@@ -100,7 +102,10 @@ DEFAULT_CFG = {
         "load_boost_pct": 70.0,     # 占用 >= 它算"高负载"
         "load_boost_s": 20.0,       # 连续高负载满这么久才拉(躲开短时突发)
         "load_hold_s": 30.0,        # 负载落下后再多吹这么久(温度还没下来)
-        "load_boost_level": 64      # 拉到的档位(64=满速); 0 = 关掉前馈
+        "load_boost_level": 64,     # 拉到的档位(64=满速); 0 = 关掉前馈
+        # ★非紧急写入之间的最小间隔(秒, 2026-10-19 加): 防"高负载时每几秒改一次风扇档"
+        #   (那天 16:32~16:34 就是 3~11 秒一次, 之后机器直接断电)。保护中/温度到 warn_c 不节流。
+        "min_write_gap_s": 10.0
     },
     # ---- 过热保护: 防止跑到固件的 _HOT 阈值被强制休眠 ----
     "guard": {
@@ -133,6 +138,9 @@ DEFAULT_CFG = {
         "trip_hold_s": 45.0,
         "min_hold_s": 30.0,
         "release_dwell_s": 10.0,
+        # ★保护退出后继续拉满风扇这么久(秒, 2026-10-19 加): "10W -> 40W" 是个功率阶跃,
+        #   退出瞬间就把风扇收回去会让温度二次冲顶(固件热事件就是这么被点着的)。
+        "cool_tail_s": 30.0,
         "escape_hibernate": False
     },
     "comment": "pl1_w/pl2_w = 插电(高性能)档, pl1_w_batt/pl2_w_batt = 电池(平衡)档。mmio_mode: disable = MMIO清零+锁后只写MSR(免重启切档, 实测本机MSR可写时推荐); value = 写目标值进MMIO+锁(老方案, 改配置要重启)。poll_s/ec_poll_s/flag_poll_s = 主循环/EC读/固件标志读的间隔秒数(EC 是慢总线, 默认 15/30 秒)。fan = 风扇模式/温度曲线; guard = 过热保护阈值(本机 _TZ.THM0 _HOT=401K 会强制休眠, 所以要这条线)。"
@@ -843,7 +851,8 @@ def ec_read_ok(off, tries=3):
 #   2) 自适应等待: 检出串位就把"写完偏移后的等待"翻倍(上限 20ms), 连续 20 次干净再退回去;
 #   3) 计数: 串位/事务数攒起来, 每 120 次事务报一行, 回头看工程机的总线到底有多糟。
 EC_CANARY = (0xC9, 65)          # (偏移, 期望值): HWAT, 本机常量
-_ECBUS = {'ok': 0, 'bad': 0, 'retry': 0, 'settle': 0.003, 'clean': 0, 'pending': False}
+_ECBUS = {'ok': 0, 'bad': 0, 'retry': 0, 'settle': 0.003, 'clean': 0, 'pending': False,
+          't0': None, 'win_s': 0.0}
 ECBUS_REPORT_EVERY = 120
 
 
@@ -876,6 +885,8 @@ def ec_bus_stat(hit_bad, retry=False):
             _ECBUS['settle'] = max(0.003, _ECBUS['settle'] / 2.0)
     if _ECBUS['ok'] + _ECBUS['bad'] >= ECBUS_REPORT_EVERY:
         _ECBUS['pending'] = True
+        _ECBUS['win_s'] = max(1.0, time.time() - (_ECBUS.get('t0') or time.time()))
+        _ECBUS['t0'] = time.time()
 
 
 def ec_bus_stats():
@@ -893,10 +904,11 @@ def ec_bus_report():
     _ECBUS['pending'] = False
     if not n_bad and not n_re:
         return None
-    return ('EC 总线体检: 最近 %d 次事务 —— 串位 %d 次(%.1f%%) / 值变动重读 %d 次, 等待 %.1f ms '
-            '—— 工程机 + 系统 ACPI EC 驱动抢端口(见 03 §4); 关键读已用哨兵挡住'
-            % (n_ok + n_bad, n_bad, 100.0 * n_bad / max(1, n_ok + n_bad), n_re,
-               _ECBUS['settle'] * 1000.0))
+    win = float(_ECBUS.get('win_s') or 0.0)
+    return ('EC 总线体检: 最近 %d 次事务(%.1f 次/分钟) —— 串位 %d 次(%.1f%%) / 值变动重读 %d 次, '
+            '等待 %.1f ms —— 工程机 + 系统 ACPI EC 驱动抢端口(见 03 §4); 关键读已用哨兵挡住'
+            % (n_ok + n_bad, 60.0 * (n_ok + n_bad) / win if win else 0.0, n_bad,
+               100.0 * n_bad / max(1, n_ok + n_bad), n_re, _ECBUS['settle'] * 1000.0))
 
 
 def ec_read_strict(off, tries=3):
@@ -1086,7 +1098,7 @@ def fan_level_of(temp, curve, prev_idx=None, hyst=5.0):
     return curve[idx][1], idx
 
 
-def fan_tick(cfg, temp=None, force_max=False, load=None):
+def fan_tick(cfg, temp=None, force_max=False, load=None, force_why=None):
     """按配置写一次风扇档位。返回变化描述; 没有变化返回 None。
 
     2026-10-19 加两处:
@@ -1152,6 +1164,19 @@ def fan_tick(cfg, temp=None, force_max=False, load=None):
         _FAN['idx'] = idx
         _FAN['lv'] = cur
         return None
+    # ---- ★写入节流(2026-10-19): 非紧急的曲线写入之间至少隔 fan.min_write_gap_s 秒 ----
+    # 2026-10-18 16:32~16:34 的日志里出现过 3~11 秒一次的风扇档写入(6 次/2 分钟), 那天
+    # 之后机器在那段高负载里直接断电了(事件 6008)。EC 是共用的慢总线, 能不写就不写:
+    # 保护中(force_max)或温度已经到 warn_c 的写入照旧立即执行, 只节流"曲线慢慢调档"。
+    gap = float(f.get('min_write_gap_s') or 0.0)
+    cur_lv = _FAN.get('lv')
+    urgent = force_max or (temp is not None and temp >= guard_cfg(cfg)['warn_c'])
+    if (gap > 0 and not urgent and cur_lv is not None and _FAN.get('t')
+            and (time.time() - _FAN['t']) < gap):
+        _FAN['idx'] = idx
+        return _note_once('fan_gap_%d_%d' % (cur_lv, want),
+                          '风扇: 想在 %.0f 秒内连改档(%s -> %s), 已按最小间隔 %.0f 秒节流'
+                          % (gap, fan_name(cur_lv), fan_name(want), gap))
     t0 = time.time()
     got = set_fan(want)
     _FAN['idx'] = idx
@@ -1160,7 +1185,7 @@ def fan_tick(cfg, temp=None, force_max=False, load=None):
     if _FAN.get('lv') != got:
         _FAN['t'] = t0                      # 档位真的变了 -> 驻留计时从这里起算
     _FAN['lv'] = got
-    why = (' (过热保护)' if force_max and mode != 'max' else
+    why = (' (%s)' % (force_why or '过热保护') if force_max and mode != 'max' else
            (' (负载前馈 %.0f%%)' % load if boosted and load is not None else
             (' (%d°C)' % temp if (idx is not None and temp is not None) else '')))
     return '风扇: %s -> %s%s' % (fan_name(cur), fan_name(got), why)
@@ -1197,7 +1222,7 @@ GUARD_MAX_JUMP = 15.0      # °C/轮: 相邻两次真读跳这么多就当天可
 EC_JUMP_RETRY_S = 2.0      # ★可疑跳变时把下一轮 EC 读提前到这么多秒(见 temp_jump_pending)
 _G = {'level': None, 'since': 0.0, 'hibernate': False, 'last_et': None, 'trip_hits': 0,
       'et_jump': False, 'et_hold': False, 'last_flags': {},
-      'trip_since': None, 'trip_latched': False, 'cool_since': None}
+      'trip_since': None, 'trip_latched': False, 'cool_since': None, 'released_at': 0.0}
 
 
 def guard_cfg(cfg):
@@ -1310,6 +1335,7 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
             old = _G['level']
             _G['level'] = None
             _G['cool_since'] = None
+            _G['released_at'] = now      # ★风扇"尾巴"从这里起算(K3)
             set_pl_override(None)
             return ('过热保护解除(EC %d°C ≤ %.0f°C 且稳住 %.0f 秒): 功耗墙恢复 [%s], '
                     '原保护等级 %s' % (et, g['recover_c'],
@@ -1464,10 +1490,12 @@ def tick(cfg=None, ec=True, read_flags=True):
         notes.append(n)
     if ec:
         g = guard_cfg(cfg)
-        force = bool(g.get('force_fan_max', True)) and _G['level'] in ('warn', 'crit', 'trip',
-                                                                       'escape', 'flag')
+        tail = cool_tail_active(cfg)
+        force = bool(g.get('force_fan_max', True)) and (
+            _G['level'] in ('warn', 'crit', 'trip', 'escape', 'flag') or tail)
         try:
-            n = fan_tick(cfg, et, force_max=force, load=load)
+            n = fan_tick(cfg, et, force_max=force, load=load,
+                         force_why='过热保护尾部' if tail and _G['level'] is None else None)
             if n:
                 notes.append(n)
         except Exception as e:
@@ -1499,8 +1527,16 @@ def tick(cfg=None, ec=True, read_flags=True):
 # 主循环只碰 MSR/MMIO(功耗墙 + CPU DTS), 保持 5 秒; 温度/风扇/固件标志走 EC, 15/30 秒一次。
 # 温度是慢变量(44°C 到 95°C 要几分钟), 风扇本身响应也是几十秒级, 所以 15 秒不误事。
 def guard_level():
-    """当前过热保护等级: None / 'warn' / 'crit' / 'trip' / 'escape'"""
+    """当前过热保护等级: None / 'warn' / 'crit' / 'trip' / 'escape' / 'flag'"""
     return _G.get('level')
+
+
+def cool_tail_active(cfg):
+    """刚退出过热保护(默认 30 秒内)? -> 风扇继续拉满, 缓冲功率阶跃带来的二次升温。"""
+    t = float(guard_cfg(cfg).get('cool_tail_s') or 0.0)
+    if t <= 0 or not _G.get('released_at'):
+        return False
+    return (time.time() - _G['released_at']) < t
 
 
 def last_ec_temp():
@@ -1574,6 +1610,15 @@ def poll_plan(cfg, fast=False, guard=False, hot=False, jump=False):
     poll = float(cfg.get('poll_s') or d['poll_s'])
     ec = float(cfg.get('ec_poll_s') or d['ec_poll_s'])
     fl = float(cfg.get('flag_poll_s') or d['flag_poll_s'])
+    # ★凉机 + 没在保护: 把固件标志读降到 flag_poll_slow_s(默认 120 秒)。
+    #   理由(2026-10-19): 标志读现在每次要 3 遍 × (哨兵+目标+哨兵) = 最多 9 次 EC 事务,
+    #   而工程机 EC 实测串位率 15%~24% —— 少打扰就是安全。凉机时读标志本来也不动手
+    #   (温度正常 -> flag 档), 所以慢一点没有代价。热起来(>= flag_hot_c)或保护中就恢复。
+    if not (fast or guard or hot):
+        slow = cfg.get('flag_poll_slow_s')
+        slow = 120.0 if slow is None else float(slow)
+        if slow > 0:                      # 0 = 不降频(照旧 30 秒读)
+            fl = max(fl, slow)
     if fast:
         poll, ec, fl = min(poll, 2.0), min(ec, 5.0), min(fl, 10.0)
     if jump:

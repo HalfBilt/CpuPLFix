@@ -10,6 +10,9 @@
     CpuPLFixCfg.py gmin=30 保护最短驻留秒数 / rel=10 解除驻留秒数
     CpuPLFixCfg.py boost=70,20,64 负载前馈：占用>=70% 满 20 秒 -> 至少满速
     CpuPLFixCfg.py boost_hold=30 负载落下后再吹 30 秒
+    CpuPLFixCfg.py fgap=10 非紧急风扇写入的最小间隔（秒）
+    CpuPLFixCfg.py flag_slow=120 凉机时固件标志读的间隔（秒）
+    CpuPLFixCfg.py cool_tail=30 退出过热保护后继续满速 30 秒
     CpuPLFixCfg.py undo        撤销上一次保存
     CpuPLFixCfg.py raw         打印完整 JSON
 
@@ -96,6 +99,8 @@ def show(cfg):
     print('  lock=%s          锁定 MMIO' % ('on' if cfg['lock_mmio'] else 'off'))
     print('  poll=%g,%g,%g      主循环/EC/固件标志（秒）'
           % (cfg['poll_s'], cfg['ec_poll_s'], cfg['flag_poll_s']))
+    print('  flag_slow=%g       凉机(EC < flag_hot)时标志读的间隔（秒，少打扰 EC）'
+          % cfg.get('flag_poll_slow_s', 120.0))
     print()
     print('【风扇】%s' % fan_desc(cfg))
     print('  fan=56,79,5      段边界 + 回差（按你机器的段数给边界）')
@@ -111,6 +116,8 @@ def show(cfg):
              cfg['fan'].get('load_boost_level', 64)))
     print('  boost_hold=%g       负载落下后再吹这么久（秒）'
           % cfg['fan'].get('load_hold_s', 30.0))
+    print('  fgap=%g            非紧急风扇写入的最小间隔（秒，0=关）'
+          % cfg['fan'].get('min_write_gap_s', 10.0))
     print()
     print('【过热保护】%s' % onoff(g['enabled']))
     print('  guard=%g,%g,%g,%g          预警/严重/逃生/解除（C）'
@@ -128,6 +135,8 @@ def show(cfg):
           % (g.get('flag_pl1_w', 20.0), g.get('flag_pl2_w', 28.0)))
     print('  gmin=%g  rel=%g     保护最短驻留 / 解除驻留（秒，防 40W↔10W 来回切）'
           % (g.get('min_hold_s', 30.0), g.get('release_dwell_s', 10.0)))
+    print('  cool_tail=%g       退出保护后继续满速这么久（秒，缓冲功率阶跃）'
+          % g.get('cool_tail_s', 30.0))
     print()
     print('改值：3-config.bat ac=40,55   |   撤销：3-config.bat undo   |   全部用法：3-config.bat help')
     print()
@@ -272,6 +281,12 @@ def apply_kv(cfg, key, val):
         f['load_boost_level'] = _num(c, 0, 64, '前馈档位', integer=True, allow_zero=True)
     elif k == 'boost_hold':
         f['load_hold_s'] = _num(val, 0, 600, '前馈尾巴秒数', allow_zero=True)
+    elif k == 'fgap':
+        f['min_write_gap_s'] = _num(val, 0, 300, '风扇写入最小间隔秒数（0=关）', allow_zero=True)
+    elif k == 'flag_slow':
+        cfg['flag_poll_slow_s'] = _num(val, 2, 3600, '凉机标志读间隔秒数', allow_zero=True)
+    elif k == 'cool_tail':
+        g['cool_tail_s'] = _num(val, 0, 600, '保护退出后继续满速秒数（0=关）', allow_zero=True)
     elif k == 'hibernate':
         g['escape_hibernate'] = _bool(val, 'hibernate')
     # ---- 单项简写
