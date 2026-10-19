@@ -84,7 +84,8 @@ DEFAULT_CFG = {
     "poll_s": 5.0,               # 主循环间隔(秒)
     "ec_poll_s": 15.0,           # EC 读间隔(秒): 温度 + 风扇档位
     "flag_poll_s": 30.0,         # 固件过热标志(0x89/0x8A/0x8B)读间隔(秒)
-    # ★凉机(EC < flag_hot_c)且没在保护时, 标志读降到这个间隔 —— 少打扰 EC(工程机串位率 15~24%)
+    # ★凉机(EC < flag_hot_c)且没在保护时, 标志读降到这个间隔 —— 少打扰 EC(EC 端口与系统
+    #   ACPI EC 驱动/固件共用, 读得越勤越容易互相插队, 见 03 §4)
     "flag_poll_slow_s": 120.0,
     # ---- 风扇(可选, 本机实测有效; 其他机型没有 EC 寄存器 0x2F 就自动跳过) ----
     "fan": {
@@ -853,9 +854,10 @@ def ec_read(off, _locked=False, delay=0.003):
         if not _ec_wait(False):
             return None
         # 等 EC 把结果放进输出缓冲。EC 忙(满载时它自己在管风扇/热区)时不会立刻应答,
-        # 不等就直接读, 读到的往往是上一次留在缓冲里的残留字节 —— 实测满载扫描时
+        # 不等就直接读, 读到的往往是别的主控留在缓冲里的残留字节 —— 实测满载扫描时
         # 一次"读 0x8A"读到的是 0x7A 的值(46), 而且连读两次都是这个残留值。
-        # 等待时间取"调用方给的"与"自适应值"的较大者(串位多了会自动变大)。
+        # 等待时间取"调用方给的"与"自适应值"的较大者。★注意等待**不是越久越好**: 等得越久,
+        # 别的主控越有时间把输出缓冲覆盖掉(实测 1ms->1.4%, 20ms->32.6%), 所以基准 3ms、上限 4ms。
         time.sleep(max(delay, ec_bus_settle()))
         v = rd_port(EC_DATA)
         if v is None:
@@ -867,15 +869,17 @@ def ec_read(off, _locked=False, delay=0.003):
 
 
 def ec_read_ok(off, tries=3):
-    """带一致性校验的读: 连续两次读到同一个值才算数, 否则加大等待重试; 都不一致就返回 None。
+    """带一致性校验的读: 连续两次读到同一个值才算数, 否则重试; 都不一致就返回 None。
 
     两道保险一起用:
-      1) 读之前等一会儿(第一次 3ms, 重试 8/20ms) —— 防"抢在 EC 应答之前读"拿到残留字节;
-      2) 连读两次比对 —— 防两个进程的事务互相插队时读到对方的应答。
+      1) 读完等一小会儿就读(基准 3ms, 上限 4ms) —— 防"抢在 EC 应答之前读"拿到残留字节。
+         ★2026-10-19 实测: 等待越久越会被别的主控插队(1ms->1.4%, 20ms->32.6%), 所以
+         这里**不再**"失败就加大等待" —— 旧版重试到 8/20ms 是在帮倒忙。
+      2) 连读两次比对 —— 防别的主控的事务插在中间时读到它的应答。
     校验不过就宁可判成"这次没读到"(沿用上一次的判断), 也不拿可疑值去改保护等级。
     """
     prev = None
-    delays = (0.003, 0.008, 0.020)
+    delays = EC_RETRY_DELAYS
     for i in range(max(2, tries)):
         v = ec_read(off, delay=delays[min(i, len(delays) - 1)])
         if v is not None and prev is not None and v == prev:
@@ -888,17 +892,35 @@ def ec_read_ok(off, tries=3):
 
 
 # ---------------------------------------------------------------- EC 总线加固
-# 工程机(ES)上 EC 与系统 ACPI EC 驱动共用 0x62/0x66, 串位比零售机常见: 实测抓到过
-# "读 0x8B 得到 0x3B"(0x3B 正是那一刻 0x78 的温度值)、"读 0x8A 得到 0x7A 的值(46)"。
+# EC 与系统 ACPI EC 驱动 / 固件 SMI 共用 0x62/0x66。我们自己的事务没问题, 问题出在
+# **写完偏移之后那段等待里, 别的主控插进来做完了它自己的事务, 把输出缓冲覆盖成它的字节**
+# —— 它读的是热区温度, 所以我们最后读到的是"别的温度寄存器的值"。
+#   实测(2026-10-19 18:35, 受控对照: settle 钉在 1ms, 50 个寄存器 x3 轮, 只变等待时间):
+#     写完偏移后等  1ms -> 同寄存器连读两次不一致  1.4%, 哨兵挡住 97.2%
+#                   3ms ->  2.8% / 92.4%
+#                   6ms -> 10.4% / 88.2%
+#                  12ms -> 22.9% / 77.8%
+#                  20ms -> 32.6% / 66.7%
+#   即 **等得越久越容易被插队**, 超过 6ms 全是负收益。错值还高度集中(55 次错值里 46 次
+#   恰好等于 0x7A 那一刻的读数), 直接证明"拿到的是别的主控留下的字节", 不是随机损坏。
+#   当日服务日志也吻合: 等待 3~6ms 的窗口报 0.8~5.0%, 被顶到 20ms 之后报 40~62%。
+#   ★教训: 旧版"检出串位就把等待翻倍(上限 20ms)"是在主动扩大对手的抢跑窗口 ——
+#     偶发的一次失败会把等待顶到上限, 而"连续 20 次干净才回落"在 50% 失败率下永远
+#     凑不满, 于是永久钉死在最差档位, 把 1.6% 放大成 60%。
 # 三道对策(成本极低, 只在关键读上多花 1~2 次事务):
 #   1) 哨兵: 0xC9(HWAT) 本机实测恒 65(见 05 §2), 断电复位也不变 —— 关键读的前后各读一次,
-#      对不上就说明这次事务序列错位了, 整批判废重来(错位时"连读两次一致"也会一致地错);
-#   2) 自适应等待: 检出串位就把"写完偏移后的等待"翻倍(上限 20ms), 连续 20 次干净再退回去;
-#   3) 计数: 串位/事务数攒起来, 每 120 次事务报一行, 回头看工程机的总线到底有多糟。
+#      对不上就说明这次事务被插队了, 整批判废重来(被插队时"连读两次一致"也会一致地错);
+#   2) 等待: 基准 3ms / 上限 4ms / 失败 3 次干净就回落 / 静默 60 秒直接回基准
+#      (★不再往上爬到 20ms —— 见上面实测);
+#   3) 计数: 串位/事务数攒起来, 每 30 次读判定报一行, 回头看总线到底有多糟。
 EC_CANARY = (0xC9, 65)          # (偏移, 期望值): HWAT, 本机常量
-_ECBUS = {'ok': 0, 'bad': 0, 'retry': 0, 'settle': 0.003, 'clean': 0, 'pending': False,
-          't0': None, 'win_s': 0.0, 'last_report': 0.0}
-ECBUS_REPORT_EVERY = 120
+EC_BASE_DELAY = 0.003           # 基准等待: 写完偏移后 3ms 再读(实测最干净的一段)
+EC_MAX_DELAY = 0.004            # 上限等待: 实测 6ms 起急剧恶化, 所以基本不爬
+EC_RETRY_DELAYS = (EC_BASE_DELAY, EC_MAX_DELAY, EC_MAX_DELAY)
+EC_DECAY_S = 60.0               # 距上次串位超过这么久 -> 等待直接回基准
+_ECBUS = {'ok': 0, 'bad': 0, 'retry': 0, 'settle': EC_BASE_DELAY, 'clean': 0, 'pending': False,
+          't0': None, 'win_s': 0.0, 'last_report': 0.0, 'last_bad': 0.0}
+ECBUS_REPORT_EVERY = 30         # 30 次读判定一行(约 5 分钟) —— 便于盯"修好了没有"
 
 
 def ec_bus_settle():
@@ -909,13 +931,19 @@ def ec_bus_settle():
 def ec_bus_stat(hit_bad, retry=False):
     """记一次事务结果 + 自适应等待; 攒够了置 pending(由 ec_bus_report 取走)。
 
-    hit_bad=True  = 哨兵不符/读不出 —— 确定的总线问题, 加大等待;
+    hit_bad=True  = 哨兵不符/读不出 —— 确定的总线问题, 把等待往上顶一格(上限 EC_MAX_DELAY);
     retry=True    = 哨兵对但两次读出的值不同 —— 温度/转速这类**本来就该变**的寄存器
                     也会这样, 只计数、不动等待(2026-10-19 修正: 早先把两者混在一起,
                     报出过 24.4% 的虚高串位率)。
     """
     if _ECBUS.get('t0') is None:
         _ECBUS['t0'] = time.time()          # 窗口起点: 不初始化会算出"120 次/1 秒"这种假速率
+    # ★2026-10-19: 时间衰减 —— 距上次串位超过 EC_DECAY_S 秒就无条件回到基准等待。
+    #   只靠"连续 N 次干净"这一个回落条件不够: 失败率 50% 时它永远凑不满。
+    _lb = _ECBUS.get('last_bad') or 0.0
+    if _ECBUS['settle'] > EC_BASE_DELAY and _lb and (time.time() - _lb) > EC_DECAY_S:
+        _ECBUS['settle'] = EC_BASE_DELAY
+        _ECBUS['clean'] = 0
     if retry and not hit_bad:
         _ECBUS['retry'] += 1
         _ECBUS['ok'] += 1
@@ -924,12 +952,17 @@ def ec_bus_stat(hit_bad, retry=False):
     if hit_bad:
         _ECBUS['bad'] += 1
         _ECBUS['clean'] = 0
-        _ECBUS['settle'] = min(0.020, _ECBUS['settle'] * 2)
+        _ECBUS['last_bad'] = time.time()
+        # ★2026-10-19: 上限从 20ms 降到 4ms。旧版"检出串位就把等待翻倍"实测是在帮倒忙
+        #   —— 等待越长, 别的主控越有时间把输出缓冲覆盖掉(1ms->1.4%, 20ms->32.6%)。
+        _ECBUS['settle'] = min(EC_MAX_DELAY, _ECBUS['settle'] * 2)
     else:
         _ECBUS['ok'] += 1
         _ECBUS['clean'] += 1
-        if _ECBUS['clean'] >= 20 and _ECBUS['settle'] > 0.003:
-            _ECBUS['settle'] = max(0.003, _ECBUS['settle'] / 2.0)
+        # ★2026-10-19: 回落条件从"连续 20 次干净"放宽到 3 次 —— 20 次在 50% 失败率下
+        #   永远凑不满, 会让等待永久钉死在上限, 把偶发失败放大成长期 40~60% 的串位率。
+        if _ECBUS['clean'] >= 3 and _ECBUS['settle'] > EC_BASE_DELAY:
+            _ECBUS['settle'] = max(EC_BASE_DELAY, _ECBUS['settle'] / 2.0)
     # ★2026-10-19: 必须加 not pending —— 否则阈值一过, 后面每来一次事务都会把 t0 推到
     #   "现在", win_s 永远退化成 max(0.2, ...) 那个地板, 日志里就成了"122 次 / 0.2 秒"。
     if (not _ECBUS['pending']
@@ -946,10 +979,11 @@ def ec_bus_stats():
 
 
 def ec_bus_report():
-    """攒够判定数且出过串位就返回一行(最多 60 秒一行); 否则 None(并把窗口清零)。
+    """攒够判定数就返回一行(最多 60 秒一行); 否则 None(并把窗口清零)。
 
     说人话: 这里数的是"一次读判定"(一次判定=1~9 次端口事务), 窗口很短时行里的
     "次/分钟"会很大 —— 那是失败快速重试的风暴(已加刹车), 不是真的在刷 EC。
+    ★2026-10-19 起即使 0 串位也会出这一行: "0 串位"本身就是"修好了"的证据, 得看得见。
     """
     if not _ECBUS['pending']:
         return None
@@ -960,10 +994,10 @@ def ec_bus_report():
     if (time.time() - (_ECBUS.get('last_report') or 0.0)) < 60.0:
         return None                       # 限频: 风暴时别刷屏
     _ECBUS['last_report'] = time.time()
-    if not n_bad and not n_re:
-        return None
+    # ★2026-10-19: 不再"没串位就不报"(老写法: if not n_bad and not n_re: return None)。
     return ('EC 总线体检: 最近 %d 次读判定 / %.1f 秒 —— 串位 %d 次(%.1f%%) / 值变动重读 %d 次, '
-            '等待 %.1f ms —— 工程机 + 系统 ACPI EC 驱动抢端口(见 03 §4); 关键读已用哨兵挡住'
+            '等待 %.1f ms —— EC 与系统 ACPI EC 驱动/固件共用 0x62/0x66, 等待越长越容易被插队'
+            '(见 03 §4); 关键读已用哨兵挡住'
             % (n_ok + n_bad, win, n_bad, 100.0 * n_bad / max(1, n_ok + n_bad), n_re,
                _ECBUS['settle'] * 1000.0))
 
@@ -975,7 +1009,7 @@ def ec_read_strict(off, tries=3):
     给"固件过热标志 0x89/0x8A/0x8B"这种一置位就要动手的寄存器用 —— 误读的代价是白压功耗。
     """
     prev = None
-    delays = (0.003, 0.008, 0.020)
+    delays = EC_RETRY_DELAYS
     for i in range(max(2, tries)):
         d = max(delays[min(i, len(delays) - 1)], ec_bus_settle())
         c1 = ec_read(EC_CANARY[0], delay=d)
@@ -1874,7 +1908,8 @@ def poll_plan(cfg, fast=False, guard=False, hot=False, jump=False):
     fl = float(cfg.get('flag_poll_s') or d['flag_poll_s'])
     # ★凉机 + 没在保护: 把固件标志读降到 flag_poll_slow_s(默认 120 秒)。
     #   理由(2026-10-19): 标志读现在每次要 3 遍 × (哨兵+目标+哨兵) = 最多 9 次 EC 事务,
-    #   而工程机 EC 实测串位率 15%~24% —— 少打扰就是安全。凉机时读标志本来也不动手
+    #   而 EC 端口与系统 ACPI EC 驱动/固件共用, 读得越勤越容易互相插队(见 03 §4)
+    #   —— 少打扰就是安全。凉机时读标志本来也不动手
     #   (温度正常 -> flag 档), 所以慢一点没有代价。热起来(>= flag_hot_c)或保护中就恢复。
     if not (fast or guard or hot):
         slow = cfg.get('flag_poll_slow_s')
