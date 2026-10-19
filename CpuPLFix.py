@@ -3368,6 +3368,15 @@ def cmd_power():
     """
     out('=== CPU 功耗信息  %s ===' % time.strftime('%Y-%m-%d %H:%M:%S'))
     out()
+    if not is_admin():
+        out('[!] 读 MSR 需要管理员权限 —— 正在弹 UAC 提权（提权后的窗口会停住，按回车关闭）...')
+        try:
+            if elevate():
+                return 0
+        except Exception:
+            pass
+        out('[X] 提权失败；请在**管理员**命令行里跑: %s power' % os.path.basename(sys.argv[0]))
+        return 1
     out('--- 芯片自己声明的约束（硬件强制，改不了）---')
     pl1_hw, t1_hw = _rapl_pl(rdmsr(0x638))
     pl2_hw, t2_hw = _rapl_pl(rdmsr(0x639))
@@ -3466,6 +3475,11 @@ def cmd_power():
     out()
     out('  怎么看: 若"满载平均"明显超过 PL1，说明功耗墙没压住（PL2 突发的 6 秒窗口也算进去）；')
     out('        若峰值≈PL2 而平均≈PL1，说明功耗墙工作正常。')
+    try:
+        if sys.stdin and sys.stdin.isatty():
+            input('\n按回车关闭这个窗口 ...')
+    except Exception:
+        pass
     return 0
 
 
