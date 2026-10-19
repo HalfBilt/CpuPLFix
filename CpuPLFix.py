@@ -719,13 +719,23 @@ def _port_call(code, inbuf, outlen):
     return ok, out
 
 
+EC_FAIL_BRAKE_S = 0.005       # ★端口调用失败后的刹车(秒): 见 rd_port/wr_port 注释
+
+
 def rd_port(port):
     ok, b = _port_call(IOCTL_READ_PORT, struct.pack('<H', port), 1)
-    return b[0] if ok else None
+    if not ok:
+        # ★2026-10-19 11:13 实测: 端口/驱动一有问题, 上层重试会在毫秒级连打上千次端口调用
+        #   (日志里出现过 "122 次判定 / 0.2 秒"). 失败后踩一脚刹车, 把最坏情况压到 ~200 次/秒。
+        time.sleep(EC_FAIL_BRAKE_S)
+        return None
+    return b[0]
 
 
 def wr_port(port, val):
     ok, _unused = _port_call(IOCTL_WRITE_PORT, struct.pack('<HHB', port, 0, val & 0xFF), 0)
+    if not ok:
+        time.sleep(EC_FAIL_BRAKE_S)
     return ok
 
 
@@ -839,6 +849,8 @@ def ec_read_ok(off, tries=3):
         if v is not None and prev is not None and v == prev:
             return v
         prev = v
+        if i + 1 < max(2, tries):
+            time.sleep(0.005)       # ★重试之间也给 EC 喘口气(2026-10-19)
     ec_bus_stat(True)       # 读到不一致/读不出: 记一次总线异常(自适应等待会加大)
     return None
 
@@ -853,7 +865,7 @@ def ec_read_ok(off, tries=3):
 #   3) 计数: 串位/事务数攒起来, 每 120 次事务报一行, 回头看工程机的总线到底有多糟。
 EC_CANARY = (0xC9, 65)          # (偏移, 期望值): HWAT, 本机常量
 _ECBUS = {'ok': 0, 'bad': 0, 'retry': 0, 'settle': 0.003, 'clean': 0, 'pending': False,
-          't0': None, 'win_s': 0.0}
+          't0': None, 'win_s': 0.0, 'last_report': 0.0}
 ECBUS_REPORT_EVERY = 120
 
 
@@ -899,19 +911,26 @@ def ec_bus_stats():
 
 
 def ec_bus_report():
-    """攒够事务数且出过串位就返回一行; 否则 None(并把窗口清零)。"""
+    """攒够判定数且出过串位就返回一行(最多 60 秒一行); 否则 None(并把窗口清零)。
+
+    说人话: 这里数的是"一次读判定"(一次判定=1~9 次端口事务), 窗口很短时行里的
+    "次/分钟"会很大 —— 那是失败快速重试的风暴(已加刹车), 不是真的在刷 EC。
+    """
     if not _ECBUS['pending']:
         return None
     n_ok, n_bad, n_re = _ECBUS['ok'], _ECBUS['bad'], _ECBUS['retry']
+    win = float(_ECBUS.get('win_s') or 0.0)
     _ECBUS['ok'] = _ECBUS['bad'] = _ECBUS['retry'] = 0
     _ECBUS['pending'] = False
+    if (time.time() - (_ECBUS.get('last_report') or 0.0)) < 60.0:
+        return None                       # 限频: 风暴时别刷屏
+    _ECBUS['last_report'] = time.time()
     if not n_bad and not n_re:
         return None
-    win = float(_ECBUS.get('win_s') or 0.0)
-    return ('EC 总线体检: 最近 %d 次事务(%.1f 次/分钟) —— 串位 %d 次(%.1f%%) / 值变动重读 %d 次, '
+    return ('EC 总线体检: 最近 %d 次读判定 / %.1f 秒 —— 串位 %d 次(%.1f%%) / 值变动重读 %d 次, '
             '等待 %.1f ms —— 工程机 + 系统 ACPI EC 驱动抢端口(见 03 §4); 关键读已用哨兵挡住'
-            % (n_ok + n_bad, 60.0 * (n_ok + n_bad) / win if win else 0.0, n_bad,
-               100.0 * n_bad / max(1, n_ok + n_bad), n_re, _ECBUS['settle'] * 1000.0))
+            % (n_ok + n_bad, win, n_bad, 100.0 * n_bad / max(1, n_ok + n_bad), n_re,
+               _ECBUS['settle'] * 1000.0))
 
 
 def ec_read_strict(off, tries=3):
