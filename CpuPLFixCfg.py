@@ -4,8 +4,12 @@
     CpuPLFixCfg.py             看当前配置
     CpuPLFixCfg.py ac=40,55    改插电 PL1/PL2
     CpuPLFixCfg.py fan=56,79,5 改风扇曲线边界 + 回差
-    CpuPLFixCfg.py hold=180 改固件标志锁存判定秒数（0=关掉这条出口）
+    CpuPLFixCfg.py hold=45 改固件标志锁存判定秒数（0=关掉这条出口）
     CpuPLFixCfg.py dwell=60 降温降档最短驻留秒数（0=关）
+    CpuPLFixCfg.py flag_pl=20,28 标志置位但温度正常时的 PL1,PL2（默认=预警档，不砍到 10W）
+    CpuPLFixCfg.py gmin=30 保护最短驻留秒数 / rel=10 解除驻留秒数
+    CpuPLFixCfg.py boost=70,20,64 负载前馈：占用>=70% 满 20 秒 -> 至少满速
+    CpuPLFixCfg.py boost_hold=30 负载落下后再吹 30 秒
     CpuPLFixCfg.py undo        撤销上一次保存
     CpuPLFixCfg.py raw         打印完整 JSON
 
@@ -102,6 +106,11 @@ def show(cfg):
     print('  hyst=%g            降档回差（C）' % cfg['fan']['hyst'])
     print('  dwell=%g           降温降档最短驻留（秒，0=关）'
           % cfg['fan'].get('min_dwell_s', 60.0))
+    print('  boost=%g,%g,%g      负载前馈：占用>=x%% 满 y 秒 -> 至少 z 档（64=满速；x=0 关）'
+          % (cfg['fan'].get('load_boost_pct', 70.0), cfg['fan'].get('load_boost_s', 20.0),
+             cfg['fan'].get('load_boost_level', 64)))
+    print('  boost_hold=%g       负载落下后再吹这么久（秒）'
+          % cfg['fan'].get('load_hold_s', 30.0))
     print()
     print('【过热保护】%s' % onoff(g['enabled']))
     print('  guard=%g,%g,%g,%g          预警/严重/逃生/解除（C）'
@@ -114,7 +123,11 @@ def show(cfg):
           % (onoff(g['enabled']), onoff(g['force_fan_max']),
              onoff(g['trip_flags']), onoff(g['escape_hibernate'])))
     print('  hold=%g            固件标志锁存判定秒数（0=关掉这条出口）'
-          % g.get('trip_hold_s', 180.0))
+          % g.get('trip_hold_s', 45.0))
+    print('  flag_pl=%g,%g       标志置位但温度正常时的 PL1,PL2（不砍到 crit 的 10W）'
+          % (g.get('flag_pl1_w', 20.0), g.get('flag_pl2_w', 28.0)))
+    print('  gmin=%g  rel=%g     保护最短驻留 / 解除驻留（秒，防 40W↔10W 来回切）'
+          % (g.get('min_hold_s', 30.0), g.get('release_dwell_s', 10.0)))
     print()
     print('改值：3-config.bat ac=40,55   |   撤销：3-config.bat undo   |   全部用法：3-config.bat help')
     print()
@@ -244,6 +257,21 @@ def apply_kv(cfg, key, val):
         g['trip_hold_s'] = _num(val, 0, 3600, '锁存判定秒数（0=关）', allow_zero=True)
     elif k == 'dwell':
         f['min_dwell_s'] = _num(val, 0, 600, '降档最短驻留秒数（0=关）', allow_zero=True)
+    elif k == 'flag_pl':
+        a, b = _nums(val, 2, 'flag_pl')
+        g['flag_pl1_w'] = _num(a, 5, 150, '标志档 PL1', allow_zero=True)
+        g['flag_pl2_w'] = _num(b, 5, 150, '标志档 PL2', allow_zero=True)
+    elif k == 'gmin':
+        g['min_hold_s'] = _num(val, 0, 600, '保护最短驻留秒数（0=关）', allow_zero=True)
+    elif k == 'rel':
+        g['release_dwell_s'] = _num(val, 0, 600, '解除驻留秒数（0=关）', allow_zero=True)
+    elif k == 'boost':
+        a, b, c = _nums(val, 3, 'boost')
+        f['load_boost_pct'] = _num(a, 0, 100, '前馈占用阈值（0=关）', allow_zero=True)
+        f['load_boost_s'] = _num(b, 0, 600, '前馈持续秒数', allow_zero=True)
+        f['load_boost_level'] = _num(c, 0, 64, '前馈档位', integer=True, allow_zero=True)
+    elif k == 'boost_hold':
+        f['load_hold_s'] = _num(val, 0, 600, '前馈尾巴秒数', allow_zero=True)
     elif k == 'hibernate':
         g['escape_hibernate'] = _bool(val, 'hibernate')
     # ---- 单项简写

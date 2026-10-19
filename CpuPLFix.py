@@ -93,7 +93,14 @@ DEFAULT_CFG = {
         "hyst": 5.0,            # 降档回差(°C), 防止温度在档位边界来回抖
         # ★降档最短驻留(秒, 2026-10-19 加): 只压"往低档退", 升档照旧立即生效;
         #   温度掉到"目标段边界 - 10°C"以下时立即放行(待机该静音还是静音)。0 = 关。
-        "min_dwell_s": 60.0
+        "min_dwell_s": 60.0,
+        # ★负载前馈(2026-10-19 加): 只按 EC 温度升档会"慢半拍" —— 0x78 是另一路传感器,
+        #   比核心真实温度滞后, 实测 100% 负载时风扇还停在 6 档, 等 EC 报 98°C 才拉满,
+        #   然后温度砸下去、风扇停、再冲上来。改为: 持续高占用就把风扇提前拉起来。
+        "load_boost_pct": 70.0,     # 占用 >= 它算"高负载"
+        "load_boost_s": 20.0,       # 连续高负载满这么久才拉(躲开短时突发)
+        "load_hold_s": 30.0,        # 负载落下后再多吹这么久(温度还没下来)
+        "load_boost_level": 64      # 拉到的档位(64=满速); 0 = 关掉前馈
     },
     # ---- 过热保护: 防止跑到固件的 _HOT 阈值被强制休眠 ----
     "guard": {
@@ -114,11 +121,18 @@ DEFAULT_CFG = {
         "flag_hot_c": 85.0,     # EC 温度到它就恢复"每次 EC 轮询都读固件标志"(平时 30 秒一次)
         "force_fan_max": True,  # 保护期间强制风扇满速
         "trip_flags": True,     # EC 0x89/0x8A/0x8B 一置位就是最高级(固件真判据)
-        # ★锁存出口(2026-10-19 加): 固件会把标志锁死不清零 —— 以前没有这条时,
-        #   PL1 被钉在 10W(倍频 10~17)自己造出锁频, 直到断电重启才恢复。
-        #   标志置位但 EC 持续 <= recover_c 满这么多秒 -> 判"固件锁存", 恢复功耗墙;
-        #   标志清零前不再据此降档(温度线 warn_c/crit_c 全程有效)。0 = 关掉这条出口。
-        "trip_hold_s": 180.0,
+        # ★2026-10-19: 标志置位**不等于现在热** —— 实测 11:04 时 0x89=0x01 而 EC 58°C/
+        #   DTS 62°C/倍频 43(4.3GHz)/占用 10%; 01:03~04:28 那次在 36~51°C 挂了 3 小时。
+        #   它是固件"记录过一次过热"的锁存位。所以温度正常时不再砍到 crit(10W):
+        #     flag_pl1_w/flag_pl2_w = 标志置位但温度正常时用的档(默认 = warn 档 20/28W)+风扇满速
+        #     trip_hold_s          = 这么凉还挂着满这么多秒 -> 判"锁存", 放开功耗墙
+        #     min_hold_s           = 进入保护后至少撑这么久(防 40W↔10W 十几秒来回切)
+        #     release_dwell_s      = 温度要连续 <= recover_c 这么久才真解除
+        "flag_pl1_w": 20.0,
+        "flag_pl2_w": 28.0,
+        "trip_hold_s": 45.0,
+        "min_hold_s": 30.0,
+        "release_dwell_s": 10.0,
         "escape_hibernate": False
     },
     "comment": "pl1_w/pl2_w = 插电(高性能)档, pl1_w_batt/pl2_w_batt = 电池(平衡)档。mmio_mode: disable = MMIO清零+锁后只写MSR(免重启切档, 实测本机MSR可写时推荐); value = 写目标值进MMIO+锁(老方案, 改配置要重启)。poll_s/ec_poll_s/flag_poll_s = 主循环/EC读/固件标志读的间隔秒数(EC 是慢总线, 默认 15/30 秒)。fan = 风扇模式/温度曲线; guard = 过热保护阈值(本机 _TZ.THM0 _HOT=401K 会强制休眠, 所以要这条线)。"
@@ -790,8 +804,12 @@ def ec_read(off, _locked=False, delay=0.003):
         # 等 EC 把结果放进输出缓冲。EC 忙(满载时它自己在管风扇/热区)时不会立刻应答,
         # 不等就直接读, 读到的往往是上一次留在缓冲里的残留字节 —— 实测满载扫描时
         # 一次"读 0x8A"读到的是 0x7A 的值(46), 而且连读两次都是这个残留值。
-        time.sleep(delay)
-        return rd_port(EC_DATA)
+        # 等待时间取"调用方给的"与"自适应值"的较大者(串位多了会自动变大)。
+        time.sleep(max(delay, ec_bus_settle()))
+        v = rd_port(EC_DATA)
+        if v is None:
+            ec_bus_stat(True)
+        return v
     finally:
         if not _locked:
             _ec_unlock(locked)
@@ -811,6 +829,88 @@ def ec_read_ok(off, tries=3):
         v = ec_read(off, delay=delays[min(i, len(delays) - 1)])
         if v is not None and prev is not None and v == prev:
             return v
+        prev = v
+    ec_bus_stat(True)       # 读到不一致/读不出: 记一次总线异常(自适应等待会加大)
+    return None
+
+
+# ---------------------------------------------------------------- EC 总线加固
+# 工程机(ES)上 EC 与系统 ACPI EC 驱动共用 0x62/0x66, 串位比零售机常见: 实测抓到过
+# "读 0x8B 得到 0x3B"(0x3B 正是那一刻 0x78 的温度值)、"读 0x8A 得到 0x7A 的值(46)"。
+# 三道对策(成本极低, 只在关键读上多花 1~2 次事务):
+#   1) 哨兵: 0xC9(HWAT) 本机实测恒 65(见 05 §2), 断电复位也不变 —— 关键读的前后各读一次,
+#      对不上就说明这次事务序列错位了, 整批判废重来(错位时"连读两次一致"也会一致地错);
+#   2) 自适应等待: 检出串位就把"写完偏移后的等待"翻倍(上限 20ms), 连续 20 次干净再退回去;
+#   3) 计数: 串位/事务数攒起来, 每 120 次事务报一行, 回头看工程机的总线到底有多糟。
+EC_CANARY = (0xC9, 65)          # (偏移, 期望值): HWAT, 本机常量
+_ECBUS = {'ok': 0, 'bad': 0, 'settle': 0.003, 'clean': 0, 'pending': False}
+ECBUS_REPORT_EVERY = 120
+
+
+def ec_bus_settle():
+    """当前"写完偏移后等 EC 应答"的等待(秒) —— 检出串位会自动加大。"""
+    return _ECBUS['settle']
+
+
+def ec_bus_stat(hit_bad):
+    """记一次事务结果 + 自适应等待; 攒够了置 pending(由 ec_bus_report 取走)。"""
+    if hit_bad:
+        _ECBUS['bad'] += 1
+        _ECBUS['clean'] = 0
+        _ECBUS['settle'] = min(0.020, _ECBUS['settle'] * 2)
+    else:
+        _ECBUS['ok'] += 1
+        _ECBUS['clean'] += 1
+        if _ECBUS['clean'] >= 20 and _ECBUS['settle'] > 0.003:
+            _ECBUS['settle'] = max(0.003, _ECBUS['settle'] / 2.0)
+    if _ECBUS['ok'] + _ECBUS['bad'] >= ECBUS_REPORT_EVERY:
+        _ECBUS['pending'] = True
+
+
+def ec_bus_stats():
+    """(事务数, 串位数, 等待毫秒) —— 给 2-check 显示。"""
+    return _ECBUS['ok'] + _ECBUS['bad'], _ECBUS['bad'], _ECBUS['settle'] * 1000.0
+
+
+def ec_bus_report():
+    """攒够事务数且出过串位就返回一行; 否则 None(并把窗口清零)。"""
+    if not _ECBUS['pending']:
+        return None
+    n_ok, n_bad = _ECBUS['ok'], _ECBUS['bad']
+    _ECBUS['ok'] = _ECBUS['bad'] = 0
+    _ECBUS['pending'] = False
+    if not n_bad:
+        return None
+    return ('EC 总线体检: 最近 %d 次事务里 %d 次串位(%.1f%%), 等待已自适应到 %.1f ms '
+            '—— 工程机 + 系统 ACPI EC 驱动抢端口, 属已知现象(见 03 §4), 可疑读数已被丢弃'
+            % (n_ok + n_bad, n_bad, 100.0 * n_bad / max(1, n_ok + n_bad), _ECBUS['settle'] * 1000.0))
+
+
+def ec_read_strict(off, tries=3):
+    """关键读(会触发动作的): 哨兵 + 两次一致, 任一不过整批判废重试, 都不成就返回 None。
+
+    比 ec_read_ok 多两道: 每次读的前后夹一次哨兵 0xC9=65; 判废时把等待加大再来一遍。
+    给"固件过热标志 0x89/0x8A/0x8B"这种一置位就要动手的寄存器用 —— 误读的代价是白压功耗。
+    """
+    prev = None
+    delays = (0.003, 0.008, 0.020)
+    for i in range(max(2, tries)):
+        d = max(delays[min(i, len(delays) - 1)], ec_bus_settle())
+        c1 = ec_read(EC_CANARY[0], delay=d)
+        v = ec_read(off, delay=d)
+        c2 = ec_read(EC_CANARY[0], delay=d)
+        good = (c1 == EC_CANARY[1] and c2 == EC_CANARY[1] and v is not None)
+        if not good:
+            ec_bus_stat(True)
+            time.sleep(0.010)
+            prev = None
+            continue
+        if prev is not None and v == prev:
+            ec_bus_stat(False)
+            return v
+        # 哨兵对、但两次读出来的值不一样 —— 也是串位(实测就是这么表现的: 读 0x8B 一次拿到
+        # 0x3B(那一刻的温度值)、下一次才对)。按异常计数 + 加大等待, 再来一遍。
+        ec_bus_stat(prev is not None)
         prev = v
     return None
 
@@ -848,13 +948,22 @@ def ec_temp():
     return v if (v is not None and 0 <= v <= 127) else None
 
 
-def ec_trip_flags():
-    """读固件判"过热强制休眠"用的标志寄存器, 返回 {offset: value}"""
+def ec_trip_flags(tmp=None):
+    """读固件判"过热强制休眠"用的标志寄存器, 返回 {offset: value}。
+
+    2026-10-19 起用 ec_read_strict(哨兵 0xC9=65 + 两次一致): 这三个寄存器一置位就要压功耗,
+    实测抓到过串位假值(0x8B 读到 0x3B, 而那正是当时的温度值), 白压一次代价是几十秒卡顿。
+    tmp = 当前 EC 温度(可选): 标志合法值是位图, 恰好等于温度字节的极罕见 —— 遇到就判读错。
+    """
     d = {}
     for h in EC_TRIP_FLAGS:
-        v = ec_read_ok(h)
-        if v is not None:
-            d[h] = v
+        v = ec_read_strict(h)
+        if v is None:
+            continue
+        if tmp is not None and v == tmp:
+            ec_bus_stat(True)
+            continue
+        d[h] = v
     return d
 
 
@@ -932,7 +1041,7 @@ def fan_cfg(cfg):
     return d
 
 
-_FAN = {'idx': None, 'lv': None, 't': 0.0}
+_FAN = {'idx': None, 'lv': None, 't': 0.0, 'hi_since': None, 'boost_until': 0.0}
 
 
 def _fan_ok(v):
@@ -964,7 +1073,7 @@ def fan_level_of(temp, curve, prev_idx=None, hyst=5.0):
     return curve[idx][1], idx
 
 
-def fan_tick(cfg, temp=None, force_max=False):
+def fan_tick(cfg, temp=None, force_max=False, load=None):
     """按配置写一次风扇档位。返回变化描述; 没有变化返回 None。
 
     2026-10-19 加两处:
@@ -975,6 +1084,7 @@ def fan_tick(cfg, temp=None, force_max=False):
     """
     f = fan_cfg(cfg)
     mode = str(f.get('mode') or 'curve').lower()
+    boosted = False
     if temp is None:
         temp = ec_temp()
     idx = None
@@ -997,6 +1107,23 @@ def fan_tick(cfg, temp=None, force_max=False):
                 and temp > f['curve'][idx][0] - 10.0
                 and (time.time() - (_FAN.get('t') or 0.0)) < dwell):
             want, idx = prev_lv, _FAN.get('idx')
+        # ---- ★负载前馈(2026-10-19): 持续高占用就把风扇提前拉起来 ----
+        # 只按 EC 温度升档会慢半拍(0x78 比核心真实温度滞后): 实测 100% 负载已跑起来时风扇
+        # 还停在 6 档, 等 EC 报 98°C 才拉满, 接着温度砸下去、风扇停、再冲上来 —— 就是那套
+        # "风扇没及时反馈 + 往复振荡"。这里用 Windows 的占用率做前馈, 不花 EC 事务。
+        lb = float(f.get('load_boost_pct') or 0.0)
+        lvl = int(f.get('load_boost_level') or 0)
+        if lb > 0 and lvl > 0 and load is not None:
+            if load >= lb:
+                if _FAN.get('hi_since') is None:
+                    _FAN['hi_since'] = time.time()
+                if time.time() - _FAN['hi_since'] >= float(f.get('load_boost_s') or 20.0):
+                    _FAN['boost_until'] = time.time() + float(f.get('load_hold_s') or 30.0)
+            else:
+                _FAN['hi_since'] = None
+            if _FAN.get('boost_until') and time.time() < _FAN['boost_until']:
+                if lvl > want:
+                    want, boosted = lvl, True
     cur = ec_hfsp()
     if cur is None:
         return None
@@ -1020,8 +1147,9 @@ def fan_tick(cfg, temp=None, force_max=False):
     if _FAN.get('lv') != got:
         _FAN['t'] = t0                      # 档位真的变了 -> 驻留计时从这里起算
     _FAN['lv'] = got
-    why = ' (过热保护)' if force_max and mode != 'max' else (
-        ' (%d°C)' % temp if (idx is not None and temp is not None) else '')
+    why = (' (过热保护)' if force_max and mode != 'max' else
+           (' (负载前馈 %.0f%%)' % load if boosted and load is not None else
+            (' (%d°C)' % temp if (idx is not None and temp is not None) else '')))
     return '风扇: %s -> %s%s' % (fan_name(cur), fan_name(got), why)
 
 
@@ -1056,7 +1184,7 @@ GUARD_MAX_JUMP = 15.0      # °C/轮: 相邻两次真读跳这么多就当天可
 EC_JUMP_RETRY_S = 2.0      # ★可疑跳变时把下一轮 EC 读提前到这么多秒(见 temp_jump_pending)
 _G = {'level': None, 'since': 0.0, 'hibernate': False, 'last_et': None, 'trip_hits': 0,
       'et_jump': False, 'et_hold': False, 'last_flags': {},
-      'trip_since': None, 'trip_latched': False}
+      'trip_since': None, 'trip_latched': False, 'cool_since': None}
 
 
 def guard_cfg(cfg):
@@ -1134,7 +1262,15 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
 
     lv = None
     if hit and _G.get('trip_hits', 0) >= 2:
-        lv = 'trip'
+        # ★2026-10-19: 标志置位**不等于现在热**。实测 11:04 时 0x89=0x01 而 EC 58°C /
+        #   DTS 62°C / 倍频 43(4.3GHz) / 占用 10%; 01:03~04:28 那次在 36~51°C 挂了 3 小时;
+        #   11:01 还在 55~74°C 的凉机上白压了两次 10W。它是固件"记录过一次过热"的锁存位。
+        #   所以按温度分档:
+        #     温度也到 warn_c(或 DTS 到 dts_crit_c) -> 'trip' = 最高级, 砍 crit_pl(10W)
+        #     温度正常                              -> 'flag' = 只风扇满速 + 收到 flag_pl(20/28W)
+        hot = ((et is not None and et >= g['warn_c'])
+               or (dts is not None and dts >= g.get('dts_crit_c', 97.0)))
+        lv = 'trip' if hot else 'flag'
     elif et is not None:                # 读不到 EC 温度就不按温度动, 免得误判
         if et >= g['escape_c']:
             lv = 'escape'
@@ -1148,16 +1284,31 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
         lv = 'crit'
     if lv is None:
         if _G['level'] and et is not None and et <= g['recover_c']:
+            # ★解除也要驻留(2026-10-19): 以前一碰 recover_c 就放开 -> 实测 10:59 压 10W、
+            #   11:01 放开、11:01 又压、11:04 又放开, 每 2~3 分钟来回一次(温度全程 55~74°C)。
+            now = time.time()
+            if now - _G.get('since', 0.0) < float(g.get('min_hold_s') or 0.0):
+                return None
+            if _G.get('cool_since') is None:
+                _G['cool_since'] = now
+                return None
+            if now - _G['cool_since'] < float(g.get('release_dwell_s') or 0.0):
+                return None
             old = _G['level']
             _G['level'] = None
+            _G['cool_since'] = None
             set_pl_override(None)
-            return '过热保护解除(EC %d°C ≤ %.0f°C): 功耗墙恢复 [%s], 原保护等级 %s' % (
-                et, g['recover_c'], _pick_profile(cfg)[2], old)
+            return ('过热保护解除(EC %d°C ≤ %.0f°C 且稳住 %.0f 秒): 功耗墙恢复 [%s], '
+                    '原保护等级 %s' % (et, g['recover_c'],
+                                       float(g.get('release_dwell_s') or 0.0),
+                                       _pick_profile(cfg)[2], old))
+        _G['cool_since'] = None
         return None
     if lv == _G['level']:
         return None
     _G['level'] = lv
     _G['since'] = time.time()
+    _G['cool_since'] = None
     if lv == 'trip':
         set_pl_override(g['crit_pl1_w'], g['crit_pl2_w'])
         desc = ', '.join('0x%02X=0x%02X' % (h, v) for h, v in hit)
@@ -1185,6 +1336,16 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
         return ('过热保护[严重]: EC %d°C ≥ %.0f°C%s —— 功耗墙压到 PL1=%.0fW/PL2=%.0fW, 风扇满速'
                 % (et, g['crit_c'], ('/DTS %d°C' % dts) if dts is not None else '',
                    g['crit_pl1_w'], g['crit_pl2_w']))
+    if lv == 'flag':
+        set_pl_override(g.get('flag_pl1_w', g['warn_pl1_w']),
+                        g.get('flag_pl2_w', g['warn_pl2_w']))
+        return ('过热保护[固件标志-降温]: EC %s 置位, 但温度正常(EC %s, DTS %s) —— 只把风扇'
+                '拉满 + 功耗墙收到 PL1=%.0fW/PL2=%.0fW(不砍到 %.0fW); 满 %.0f 秒还这么凉就判'
+                '"锁存"放开(温度线 %g/%g 全程有效)'
+                % (desc, ('%d°C' % et) if et is not None else '读不到',
+                   ('%d°C' % dts) if dts is not None else '--',
+                   g.get('flag_pl1_w', 20.0), g.get('flag_pl2_w', 28.0),
+                   g['crit_pl1_w'], hold, g['warn_c'], g['crit_c']))
     set_pl_override(g['warn_pl1_w'], g['warn_pl2_w'])
     return ('过热保护[预警]: EC %d°C ≥ %.0f°C —— 功耗墙压到 PL1=%.0fW/PL2=%.0fW, 风扇满速'
             % (et, g['warn_c'], g['warn_pl1_w'], g['warn_pl2_w']))
@@ -1246,11 +1407,12 @@ def tick(cfg=None, ec=True, read_flags=True):
         dts = tv['temp'] if tv else None
     except Exception:
         dts = None
+    load = cpu_load_pct()          # 每轮都采(不碰 EC/不开句柄), 给风扇前馈用
     flags = _G.get('last_flags') or {}
     fresh = bool(ec and read_flags)
     if fresh:
         try:
-            flags = ec_trip_flags()
+            flags = ec_trip_flags(_G.get('last_et'))
             _G['last_flags'] = flags
         except Exception:
             flags = _G.get('last_flags') or {}
@@ -1267,13 +1429,16 @@ def tick(cfg=None, ec=True, read_flags=True):
     if ec:
         g = guard_cfg(cfg)
         force = bool(g.get('force_fan_max', True)) and _G['level'] in ('warn', 'crit', 'trip',
-                                                                       'escape')
+                                                                       'escape', 'flag')
         try:
-            n = fan_tick(cfg, et, force_max=force)
+            n = fan_tick(cfg, et, force_max=force, load=load)
             if n:
                 notes.append(n)
         except Exception as e:
             notes.append('风扇写入异常: %s' % e)
+        rep = ec_bus_report()
+        if rep:
+            notes.append(rep)
     # ---- ★电池链路看门狗(2026-10-19 加) -----------------------------------------
     # 那天 ACPI 电池数据全变成 0xFFFFFFFF(设计/满充 = -1 mWh), 工具全程无感, 是用户
     # 自己发现"电池显示 -1"。GetSystemPowerStatus 不碰 EC、不花代价, 所以每轮都查。
@@ -1320,6 +1485,44 @@ def temp_jump_pending():
 def flag_hot_c(cfg):
     """EC 温度到它就恢复"每次 EC 轮询都读固件标志"的阈值"""
     return float(guard_cfg(cfg).get('flag_hot_c') or 85.0)
+
+
+class _FILETIME64(ctypes.Structure):
+    _fields_ = [('dwLowDateTime', w.DWORD), ('dwHighDateTime', w.DWORD)]
+
+
+def _ft64(v):
+    return (v.dwHighDateTime << 32) | v.dwLowDateTime
+
+
+_LOAD = {'last': None, 'ema': None}
+
+
+def cpu_load_pct():
+    """系统 CPU 占用率(%): GetSystemTimes 的时间差, 二次调用起才有值(第一次返回 None)。
+
+    给风扇前馈用: 不碰 EC、不读 MSR、不打开句柄, 纯 Windows API, 代价可以忽略。
+    指数平滑(0.6/0.4)压掉瞬时毛刺 —— 前馈要的是"持续高负载", 不是某一帧的尖峰。
+    """
+    try:
+        idle, kern, user = _FILETIME64(), _FILETIME64(), _FILETIME64()
+        if not k32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kern),
+                                  ctypes.byref(user)):
+            return None
+        i, k, u = _ft64(idle), _ft64(kern), _ft64(user)
+        last = _LOAD['last']
+        _LOAD['last'] = (i, k, u)
+        if last is None:
+            return None
+        di = i - last[0]
+        tot = (k - last[1]) + (u - last[2])
+        if tot <= 0:
+            return _LOAD['ema']
+        busy = max(0.0, min(1.0, (tot - di) / float(tot))) * 100.0
+        _LOAD['ema'] = busy if _LOAD['ema'] is None else (_LOAD['ema'] * 0.6 + busy * 0.4)
+        return _LOAD['ema']
+    except Exception:
+        return None
 
 
 def poll_plan(cfg, fast=False, guard=False, hot=False, jump=False):
@@ -1447,7 +1650,7 @@ def cmd_check():
         cur = ec_hfsp()
         t = ec_temp()
         r = ec_rpm()
-        fl = ec_trip_flags()
+        fl = ec_trip_flags(t)
         hit = ec_tripped(fl)
         out('%s %s' % (_pad('风扇档位 HFSP', 26),
                        ('%s (0x%02X)' % (fan_name(cur), cur)) if cur is not None else '读取失败'))
@@ -1460,9 +1663,31 @@ def cmd_check():
                                                           0x7D: 'TTS3', 0x7E: 'TTS4', 0xC9: 'HWAT'}.get(k, '?'),
                                                          k, v) for k, v in sorted(et.items()))
                            + '   (另一组传感器, 只记录, 不参与逻辑)'))
-        out('%s %s' % (_pad('固件过热标志', 26),
-                       flags_desc(fl) + ('   [!] 已置位(固件正在报 _HOT)' if hit else '   (正常)')
-                       if fl else '读取失败'))
+        if fl:
+            _s = flags_desc(fl)
+            if hit:
+                _nowt = ec_temp()
+                _hot = (_nowt is not None and _nowt >= g['warn_c'])
+                _s += ('   [!] 已置位 —— ' + ('且温度也到 %.0f°C, 按最高级处理'
+                                              % g['warn_c'] if _hot else
+                                              '但温度正常: 这是固件"记录过一次过热"的**锁存位**, '
+                                              '不是现在就热 → 只拉风扇降温, 不砍到 10W'))
+            else:
+                _s += '   (正常)'
+        else:
+            _s = '读取失败'
+        out('%s %s' % (_pad('固件过热标志', 26), _s))
+        _l1 = cpu_load_pct()
+        time.sleep(0.5)
+        _l2 = cpu_load_pct()
+        if _l2 is not None:
+            _lb = fan_cfg(cfg)
+            out('%s %.1f%%   (风扇负载前馈: >=%.0f%% 满 %.0f 秒 -> %d 档)'
+                % (_pad('CPU 占用', 26), _l2, _lb.get('load_boost_pct', 70.0),
+                   _lb.get('load_boost_s', 20.0), _lb.get('load_boost_level', 64)))
+        _n, _b, _ms = ec_bus_stats()
+        out('%s 本进程事务 %d 次 / 串位 %d 次, 当前自适应等待 %.1f ms'
+            % (_pad('EC 总线', 26), _n, _b, _ms))
         out('%s %s' % (_pad('风扇模式', 26), '%s   (config.json -> fan.mode)' % f.get('mode')))
         if str(f.get('mode')).lower() == 'curve':
             out('%s %s' % (_pad('温度曲线', 26),
