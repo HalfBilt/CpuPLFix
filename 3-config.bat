@@ -13,7 +13,7 @@ if not exist "%~dp0runtime\python.exe" (
 "%~dp0runtime\python.exe" "%~dp0CpuPLFixCfg.py" %*
 set RC=%ERRORLEVEL%
 
-rem ????????????, ?????????; ????????????
+rem Pause only when double-clicked; do not pause when called from a script.
 echo %cmdcmdline% | find /i "%~nx0" >nul
 if not errorlevel 1 pause
 exit /b %RC%
