@@ -143,6 +143,7 @@ def show(cfg):
           % (onoff(g['enabled']), onoff(g['force_fan_max']),
              onoff(g['trip_flags']), onoff(g['escape_hibernate'])))
     print('  hold=%g            固件标志锁存判定秒数（0=关掉这条出口）'
+          ' ★=同时写 flag_rel 的秒数，两者等价'
           % g.get('trip_hold_s', 45.0))
     print('  tpower=%s          温度→功耗调节器（风扇优先：日常功耗跟着温度走；关=用固定 pl1_w）'
           % onoff(g.get('temp_power', False)))
@@ -302,7 +303,12 @@ def apply_kv(cfg, key, val):
     elif k == 'trip':
         g['trip_flags'] = _bool(val, 'trip')
     elif k == 'hold':
-        g['trip_hold_s'] = _num(val, 0, 3600, '锁存判定秒数（0=关）', allow_zero=True)
+        # ★2026-10-20 修: 新代码的锁存判定读的是 flag_release_s（默认 60），
+        #   只写 trip_hold_s 的话 `hold=` 改了不生效（用户可感知的"改了没反应"）。
+        #   这里两个键一起写 —— trip_hold_s 留给旧版代码/旧配置读，flag_release_s 给现版读。
+        _hv = _num(val, 0, 3600, '锁存判定秒数（0=关）', allow_zero=True)
+        g['trip_hold_s'] = _hv
+        g['flag_release_s'] = _hv
     elif k == 'tpower':
         # ★2026-10-20: 温度→功耗调节器("风扇优先"模型), 默认关。
         # on = 日常功耗跟着温度走(顶档受 ac= 配的 pl1_w 约束), 保护阶梯只在 ≥98°C 接手。
