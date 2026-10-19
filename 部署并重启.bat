@@ -64,6 +64,9 @@ powershell -NoProfile -Command "Get-Content -Encoding UTF8 -Tail 14 '%LOG%'"
 echo ----------------------------------------------------------
 echo.
 echo Done. The next EC report line needs about 5-6 minutes.
-echo Compare its wait value: 3.0 ms means the fix is live, 20.0 ms means it is not.
+echo How to confirm THIS build is live (the wait value no longer tells you):
+echo   - 2-check prints "fan 6 (.3880 RPM)" instead of the old 3490 label
+echo   - fan write problems now say either "write failed" or "readback not confirmed"
+echo   - a new "===== ... svc =====" block appears in fix.log after the restart
 echo.
 pause
