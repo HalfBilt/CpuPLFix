@@ -2043,6 +2043,11 @@ def tick(cfg=None, ec=True, read_flags=True):
     n = guard_apply(cfg, et, dts, flags, flags_fresh=fresh)
     if n:
         notes.append(n)
+    # ★2026-10-20 温度→功耗调节器("风扇优先"模型): 保护没在管的时候, 日常功耗跟着温度走;
+    #   保护一旦进入任何等级, 调节器立刻让位(它只在 guard.temp_power=on 时才动手)。
+    n = temp_power_apply(cfg, et, dts)
+    if n:
+        notes.append(n)
     n = ensure_profile(cfg)
     if n:
         notes.append(n)
@@ -3481,6 +3486,93 @@ def cmd_power():
     except Exception:
         pass
     return 0
+
+
+# ---- ★温度→功耗调节器("风扇优先"模型) --------------------------------------
+# 2026-10-20 用户提出: "高负载下风扇满速, 然后最大功耗能是多少, 用这种方式来控温;
+# 不应该每次都撞功耗墙, 撞功耗墙应该是一种保护手段。"
+# 这台机器的散热能力(实测): 风扇满速时 28W 能稳在 EC 89~95°C, 40W 会在 30 秒~2 分钟里
+# 撞到 99°C —— 所以"最大功耗能是多少"的答案是 **持续 ~28~30W, 短时能到 45~64W(吃热容)**。
+#
+# 为什么不能直接拿保护阶梯(guard_apply)当调速器:
+#   阶梯是"只降不升"的 —— 释放条件是 EC <= recover_c(78°C), 而热着的机器根本到不了 78°C,
+#   于是它会一路踩到地板档(12W)并且**永远停在那**(手册 02 §3.1 记过同款 bug:
+#   "凉机上被白压两次 10W")。所以日常调速必须是一个**独立、带回差、能升回来**的调节器,
+#   保护阶梯只留作硬保护(98/105°C 那两级)。
+#
+# 映射(默认, 保守; 每一档是"温度低于阈值时能用的 PL1"): 越热越收, 顶档受 config 的
+# pl1_w 约束(那就是用户说的"最大功耗能是多少")。回差 3°C, 每轮最多改 3W(防抖)。
+TEMP_POWER_DEFAULT_MAP = [[82.0, 45.0], [85.0, 38.0], [90.0, 30.0],
+                           [93.0, 28.0], [96.0, 22.0]]
+TEMP_POWER_HYST = 3.0        # °C: 降档要越过阈值, 升回来要低 3 度
+TEMP_POWER_RATE = 3.0        # W/次: 每轮最多改这么多
+
+
+def temp_power_apply(cfg, et=None, dts=None):
+    """按温度决定"日常功耗"(风扇优先模型)。返回变化描述; 没动返回 None。
+
+    开启条件: config.json 的 `guard.temp_power = true`(**默认 false = 保持老行为**)。
+    让位条件: 只要过热保护处于任何等级(warn/crit/crit2/crit3/trip/escape/flag),
+              就完全交给保护阶梯 —— 调节器只管"没有保护时的日常功耗"。
+
+    2026-10-20: 现在 PL1 是个静态值(28W), 任何重负载都"撞功耗墙"(CPU 被功耗限住,
+    而不是被温度限住); 本调节器把"日常功耗"变成温度的函数: 温度低就多吃瓦(吃热容、
+    相当于一次 turbo 突发), 温度上来了按比例收 —— 撞功耗墙重新变成**保护**手段。
+    """
+    g = guard_cfg(cfg)
+    if not bool(g.get('temp_power', False)):
+        if _G.get('tp_on'):
+            _G['tp_on'] = False
+            _G['tp_idx'] = None
+            _G['tp_pl1'] = 0.0
+            if _G.get('level') is None:
+                set_pl_override(None)      # 交回配置里的档
+        return None
+    if _G.get('level') is not None:
+        return None                      # 保护在管, 调节器让位
+    if et is None:
+        et = last_ec_temp()
+    if et is None:
+        return None
+    ceiling = float(cfg.get('pl1_w') or 0) or 45.0
+    if not on_ac():
+        ceiling = float(cfg.get('pl1_w_batt') or 0) or min(ceiling, 20.0)
+    mp = g.get('temp_power_map') or TEMP_POWER_DEFAULT_MAP
+    try:
+        mp = [(float(a), float(b)) for a, b in mp]
+    except Exception:
+        mp = TEMP_POWER_DEFAULT_MAP
+    # 目标档: 温度落在哪个区间(索引越大 = 越热 = 功耗越低)
+    idx = 0
+    for i in range(len(mp)):
+        if et >= mp[i][0]:
+            idx = i
+    # 往更凉的方向(索引变小=功耗变大)要留回差, 否则会在阈值上反复横跳
+    cur = _G.get('tp_idx')
+    if cur is not None and idx < cur:
+        if et >= mp[cur][0] - TEMP_POWER_HYST:
+            idx = cur
+    want = min(float(mp[idx][1]), ceiling)
+    floor = float(g.get('temp_power_min') or 18.0)
+    want = max(want, min(floor, ceiling))
+    # 每轮最多改 TEMP_POWER_RATE 瓦, 防抖
+    last = float(_G.get('tp_pl1') or 0.0)
+    if _G.get('tp_on') and last > 0:
+        if want > last + TEMP_POWER_RATE:
+            want = last + TEMP_POWER_RATE
+        elif want < last - TEMP_POWER_RATE:
+            want = last - TEMP_POWER_RATE
+    pl2_cap = float(cfg.get('pl2_w') or 0) or 0
+    pl2 = min(pl2_cap, max(want * 1.5, want)) if pl2_cap else want * 1.5
+    _G['tp_on'] = True
+    _G['tp_idx'] = idx
+    if abs(last - want) < 0.5 and _G.get('tp_pl1'):
+        return None
+    _G['tp_pl1'] = want
+    set_pl_override(want, pl2)
+    return ('功耗调节[温度→瓦]: EC %.0f°C -> PL1 %.0fW / PL2 %.0fW'
+            '（上限 %.0fW = config 的 pl1_w；保护阶梯仍只在 ≥98°C 时接手）'
+            % (et, want, pl2, ceiling))
 
 
 def main():

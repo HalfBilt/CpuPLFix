@@ -5,6 +5,7 @@
     CpuPLFixCfg.py ac=40,55    改插电 PL1/PL2
     CpuPLFixCfg.py fan=56,79,5 改风扇曲线边界 + 回差
     CpuPLFixCfg.py hold=45 改固件标志锁存判定秒数（0=关掉这条出口）
+    CpuPLFixCfg.py tpower=on/off 温度→功耗调节器（风扇优先：日常功耗跟着温度走；默认 off）
     CpuPLFixCfg.py dwell=60 降温降档最短驻留秒数（0=关）
     CpuPLFixCfg.py flag_pl=20,28 标志置位但温度正常时的 PL1,PL2（默认=预警档，不砍到 10W）
     CpuPLFixCfg.py gmin=30 保护最短驻留秒数 / rel=10 解除驻留秒数
@@ -143,6 +144,8 @@ def show(cfg):
              onoff(g['trip_flags']), onoff(g['escape_hibernate'])))
     print('  hold=%g            固件标志锁存判定秒数（0=关掉这条出口）'
           % g.get('trip_hold_s', 45.0))
+    print('  tpower=%s          温度→功耗调节器（风扇优先：日常功耗跟着温度走；关=用固定 pl1_w）'
+          % onoff(g.get('temp_power', False)))
     print('  flag_pl=%g,%g       标志置位但温度正常时的 PL1,PL2（不砍到 crit 的 10W）'
           % (g.get('flag_pl1_w', 20.0), g.get('flag_pl2_w', 28.0)))
     print('  gmin=%g  rel=%g     保护最短驻留 / 解除驻留（秒，防 40W↔10W 来回切）'
@@ -300,6 +303,10 @@ def apply_kv(cfg, key, val):
         g['trip_flags'] = _bool(val, 'trip')
     elif k == 'hold':
         g['trip_hold_s'] = _num(val, 0, 3600, '锁存判定秒数（0=关）', allow_zero=True)
+    elif k == 'tpower':
+        # ★2026-10-20: 温度→功耗调节器("风扇优先"模型), 默认关。
+        # on = 日常功耗跟着温度走(顶档受 ac= 配的 pl1_w 约束), 保护阶梯只在 ≥98°C 接手。
+        g['temp_power'] = _bool(val, 'tpower')
     elif k == 'dwell':
         f['min_dwell_s'] = _num(val, 0, 600, '降档最短驻留秒数（0=关）', allow_zero=True)
     elif k == 'flag_pl':
