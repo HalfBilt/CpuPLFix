@@ -4,3 +4,6 @@ __pycache__/
 *.pyc
 _task.xml
 dev/ec_scan_out.txt
+
+# agent 的临时备份不进仓库(备份留在 %APPDATA%\CpuPLFix\)
+*.bak-*
