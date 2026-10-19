@@ -230,7 +230,10 @@ def boot_trigger(up):
         # 所以允许一点负抖动; 真正重启会让 d_u 变成很大的负数(那时 up 也 < 600)。
         if d_u > -2.0:
             slept = (now_w - last_w) - max(0.0, d_u)
-            if slept > 60:                      # 真睡过
+            # ★2026-10-19: 60 秒改成 20 秒 —— 11:29:42 那次固件热事件强制休眠只睡了
+            #   45 秒, 被这里判成"定时复查", 于是 cmd_boot 里查 Event 88 的那段没跑,
+            #   日志里少了一句"上次是固件热事件强制休眠"。
+            if slept > 20:                      # 真睡过
                 tag = '睡眠/休眠唤醒后, 睡掉 %.0f 秒' % slept
             elif up < 600:                      # 开机后计划任务的 5 分钟重复
                 tag, quiet = '开机后复查', True
@@ -920,7 +923,10 @@ def ec_bus_stat(hit_bad, retry=False):
         _ECBUS['clean'] += 1
         if _ECBUS['clean'] >= 20 and _ECBUS['settle'] > 0.003:
             _ECBUS['settle'] = max(0.003, _ECBUS['settle'] / 2.0)
-    if _ECBUS['ok'] + _ECBUS['bad'] >= ECBUS_REPORT_EVERY:
+    # ★2026-10-19: 必须加 not pending —— 否则阈值一过, 后面每来一次事务都会把 t0 推到
+    #   "现在", win_s 永远退化成 max(0.2, ...) 那个地板, 日志里就成了"122 次 / 0.2 秒"。
+    if (not _ECBUS['pending']
+            and _ECBUS['ok'] + _ECBUS['bad'] >= ECBUS_REPORT_EVERY):
         _ECBUS['pending'] = True
         _ECBUS['win_s'] = max(0.2, time.time() - (_ECBUS.get('t0') or time.time()))
         _ECBUS['t0'] = time.time()
@@ -1028,9 +1034,14 @@ def ec_trip_flags(tmp=None):
     for h in EC_TRIP_FLAGS:
         v = ec_read_strict(h)
         if v is None:
+            # ★2026-10-19: 读失败**不能**把这个 key 删掉 —— 删掉之后上层 ec_tripped({})
+            #   得到的是"没有标志", 于是 flag 档被放开、下一轮又压回去(实测每 50~90 秒
+            #   一个来回)。这里保留 key、值为 None, 由 merge_flags() 决定沿用上一轮的值。
+            d[h] = None
             continue
         if tmp is not None and v == tmp:
             ec_bus_stat(True)
+            d[h] = None          # 值恰好等于温度字节 -> 判读错, 同样按"没读到"处理
             continue
         d[h] = v
     return d
@@ -1038,7 +1049,27 @@ def ec_trip_flags(tmp=None):
 
 def ec_tripped(flags):
     """有标志置位(低 7 位非零)就返回 [(offset, value), ...]"""
-    return sorted((h, v) for h, v in (flags or {}).items() if v & 0x7F)
+    return sorted((h, v) for h, v in (flags or {}).items()
+                  if v is not None and (v & 0x7F))
+
+
+def merge_flags(new, old):
+    """把这一轮的标志读数与上一轮合并 -> (merged, complete)。
+
+    ★2026-10-19: 读失败(None) **不等于** "标志没了"。读不到时沿用上一轮的值，并告诉
+    调用方"这一轮不算新证据"(complete=False -> flags_fresh=False)，这样 trip_hits /
+    clr_hits 都不会被一次失败的读推动。原则：读不到就什么都不做，别当成清零。
+    """
+    new = new or {}
+    old = old or {}
+    merged, complete = {}, True
+    for h in EC_TRIP_FLAGS:
+        v = new.get(h)
+        if v is None:
+            complete = False
+            v = old.get(h)
+        merged[h] = v
+    return merged, complete
 
 
 def ec_rpm():
@@ -1351,26 +1382,32 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
     desc = ', '.join('0x%02X=0x%02X' % (h, v) for h, v in hit)
     if not hit:
         _G['trip_since'] = None
-        if _G.get('trip_latched'):
-            # ★2026-10-19 实机发现: 标志读会被 EC 串位读成 0 —— 单轮"读到 0"就解除锁存, 下一轮
-            #   又读回 1, 于是 flag(20/28) → 解除+回升 → flag 之间每 5 秒来回一次(日志可见)。
-            #   跟"置位也要连续两轮"对称: 清零也要求**连续两轮真读**都没标志。
-            if flags_fresh:
-                _G['clr_hits'] = int(_G.get('clr_hits') or 0) + 1
-            if _G['clr_hits'] >= 2:
-                _G['trip_latched'] = False
-                _G['clr_hits'] = 0
-                if _G['level'] in ('flag', 'trip'):
-                    _G['level'] = None
-                    _G['step'] = 0
-                    set_pl_override(None)
-                return ('固件过热标志已清零(连续两轮确认), 解除"锁存"判定'
-                        '(下次置位仍会正常保护)')
+        # ★2026-10-19(补 06d4e01 漏掉的一半): 清零也要连续两轮真读才认 —— 而且**不管有没有
+        #   进过"锁存"**。原来这段只写在 trip_latched 分支里, 可实测的抖动根本不进那个分支
+        #   (trip_hold_s=45 秒永远追不上 42~44 秒的温度解除), 所以 clr_hits 一次都没生效。
+        if flags_fresh:
+            _G['clr_hits'] = int(_G.get('clr_hits') or 0) + 1
+        if int(_G.get('clr_hits') or 0) >= 2:
+            was_latched = bool(_G.get('trip_latched'))
+            _G['trip_latched'] = False
+            _G['clr_hits'] = 0
+            released = _G['level'] in ('flag', 'trip')
+            if released:
+                _G['level'] = None
+                _G['step'] = 0
+                _G['ramp'] = None
+                set_pl_override(None)
+            if was_latched or released:
+                return ('固件过热标志已清零(连续两轮真读确认)%s'
+                        % (' —— 解除"锁存"判定, 功耗墙恢复原档(下次置位仍会正常保护)'
+                           if was_latched else
+                           ' —— 退出"标志降温"档, 功耗墙恢复原档'))
     elif _G.get('trip_hits', 0) >= 2:
         _G['clr_hits'] = 0
         if _G.get('trip_since') is None:
             _G['trip_since'] = time.time()
-        if (hold > 0 and et is not None and et <= g['recover_c']
+        if (hold > 0 and not _G.get('trip_latched')
+                and et is not None and et <= g['recover_c']
                 and time.time() - _G['trip_since'] >= hold):
             _G['trip_latched'] = True
             _G['trip_since'] = time.time()
@@ -1454,7 +1491,11 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
         # 不能跟 EC 并列当触发条件 —— 否则会"压 10W -> 下一轮读回正常 -> 解除"地来回抖。
         lv = 'crit'
     if lv is None:
-        if _G['level'] and et is not None and et <= g['recover_c']:
+        # ★2026-10-19: flag 档只走两条出口 —— ① 45 秒锁存判定 ② 连续两轮确认清零。
+        #   绝不能走下面这条"温度恢复就放开": flag 档本来就是在凉机上压的, 一进来就满足
+        #   et <= recover_c, 40~44 秒后必然放开 -> 放开 3 秒又被压回去, 无限循环。
+        if (_G['level'] and _G['level'] != 'flag'
+                and et is not None and et <= g['recover_c']):
             # ★解除也要驻留(2026-10-19): 以前一碰 recover_c 就放开 -> 实测 10:59 压 10W、
             #   11:01 放开、11:01 又压、11:04 又放开, 每 2~3 分钟来回一次(温度全程 55~74°C)。
             now = time.time()
@@ -1660,8 +1701,12 @@ def tick(cfg=None, ec=True, read_flags=True):
     fresh = bool(ec and read_flags)
     if fresh:
         try:
-            flags = ec_trip_flags(_G.get('last_et'))
+            flags, complete = merge_flags(ec_trip_flags(_G.get('last_et')),
+                                          _G.get('last_flags'))
             _G['last_flags'] = flags
+            if not complete:
+                # 有寄存器没读到 -> 这一轮不算新证据(既不算命中, 也不算清零)
+                fresh = False
         except Exception:
             flags = _G.get('last_flags') or {}
             fresh = False
@@ -1787,7 +1832,8 @@ def poll_plan(cfg, fast=False, guard=False, hot=False, jump=False):
     """统一算三个轮询间隔(秒) -> (主循环, EC 读, 固件标志读)。
 
       fast  —— 开机/唤醒后前几分钟: 档位和风扇要尽快收敛, 三个都加密;
-      guard —— 过热保护生效期间: 温度和标志都得盯紧, EC 读提到跟主循环同频;
+      guard —— 过热保护生效期间: 温度读提到跟主循环同频, 标志读最多 15 秒一次
+               (标志是锁存位, 读太勤只会增加 EC 事务和读失败);
       hot   —— EC 温度高于 flag_hot_c: 标志改跟 EC 读同频(平时 30 秒一次);
       jump  —— ★上一轮 EC 温度跳变被当可疑值压住了(temp_jump_pending): EC 读提前到
                EC_JUMP_RETRY_S, 赶紧再确认一次, 别让风扇白等一个 ec_poll_s。
@@ -1810,7 +1856,11 @@ def poll_plan(cfg, fast=False, guard=False, hot=False, jump=False):
     if jump:
         ec, fl = min(ec, EC_JUMP_RETRY_S), min(fl, EC_JUMP_RETRY_S)
     if guard:
-        ec, fl = min(ec, poll), min(fl, poll)
+        ec = min(ec, poll)
+        # ★2026-10-19: 标志是"锁存位", 保护期间没必要跟主循环同频 —— 每次最多 9 次 EC 事务,
+        #   而工程机读失败率 15~26%, 读得越勤越容易把"读不到"变成"标志没了"(见 merge_flags)。
+        #   温度线仍跟主循环(5 秒), 标志降到 15 秒。
+        fl = min(fl, max(ec, 15.0))
     elif hot:
         fl = min(fl, ec)
     return max(1.0, poll), max(2.0, ec), max(2.0, fl)
