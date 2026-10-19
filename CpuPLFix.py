@@ -99,8 +99,9 @@ DEFAULT_CFG = {
         # ★负载前馈(2026-10-19 加): 只按 EC 温度升档会"慢半拍" —— 0x78 是另一路传感器,
         #   比核心真实温度滞后, 实测 100% 负载时风扇还停在 6 档, 等 EC 报 98°C 才拉满,
         #   然后温度砸下去、风扇停、再冲上来。改为: 持续高占用就把风扇提前拉起来。
+        "dts_max_c": 92.0,          # ★DTS(核心温度, 5 秒粒度)到它立刻拉满 —— 比 EC 0x78 快得多
         "load_boost_pct": 70.0,     # 占用 >= 它算"高负载"
-        "load_boost_s": 20.0,       # 连续高负载满这么久才拉(躲开短时突发)
+        "load_boost_s": 10.0,       # 连续高负载满这么久才拉(躲开短时突发; 5 秒粒度计时)
         "load_hold_s": 30.0,        # 负载落下后再多吹这么久(温度还没下来)
         "load_boost_level": 64,     # 拉到的档位(64=满速); 0 = 关掉前馈
         # ★非紧急写入之间的最小间隔(秒, 2026-10-19 加): 防"高负载时每几秒改一次风扇档"
@@ -869,6 +870,8 @@ def ec_bus_stat(hit_bad, retry=False):
                     也会这样, 只计数、不动等待(2026-10-19 修正: 早先把两者混在一起,
                     报出过 24.4% 的虚高串位率)。
     """
+    if _ECBUS.get('t0') is None:
+        _ECBUS['t0'] = time.time()          # 窗口起点: 不初始化会算出"120 次/1 秒"这种假速率
     if retry and not hit_bad:
         _ECBUS['retry'] += 1
         _ECBUS['ok'] += 1
@@ -885,7 +888,7 @@ def ec_bus_stat(hit_bad, retry=False):
             _ECBUS['settle'] = max(0.003, _ECBUS['settle'] / 2.0)
     if _ECBUS['ok'] + _ECBUS['bad'] >= ECBUS_REPORT_EVERY:
         _ECBUS['pending'] = True
-        _ECBUS['win_s'] = max(1.0, time.time() - (_ECBUS.get('t0') or time.time()))
+        _ECBUS['win_s'] = max(0.2, time.time() - (_ECBUS.get('t0') or time.time()))
         _ECBUS['t0'] = time.time()
 
 
@@ -1098,7 +1101,8 @@ def fan_level_of(temp, curve, prev_idx=None, hyst=5.0):
     return curve[idx][1], idx
 
 
-def fan_tick(cfg, temp=None, force_max=False, load=None, force_why=None):
+def fan_tick(cfg, temp=None, force_max=False, load=None, force_why=None,
+             boost=False, dts=None):
     """按配置写一次风扇档位。返回变化描述; 没有变化返回 None。
 
     2026-10-19 加两处:
@@ -1132,23 +1136,18 @@ def fan_tick(cfg, temp=None, force_max=False, load=None, force_why=None):
                 and temp > f['curve'][idx][0] - 10.0
                 and (time.time() - (_FAN.get('t') or 0.0)) < dwell):
             want, idx = prev_lv, _FAN.get('idx')
-        # ---- ★负载前馈(2026-10-19): 持续高占用就把风扇提前拉起来 ----
-        # 只按 EC 温度升档会慢半拍(0x78 比核心真实温度滞后): 实测 100% 负载已跑起来时风扇
-        # 还停在 6 档, 等 EC 报 98°C 才拉满, 接着温度砸下去、风扇停、再冲上来 —— 就是那套
-        # "风扇没及时反馈 + 往复振荡"。这里用 Windows 的占用率做前馈, 不花 EC 事务。
-        lb = float(f.get('load_boost_pct') or 0.0)
+        # ---- ★两条前馈(2026-10-19) ------------------------------------------
+        # 只按 EC 温度升档会"慢半拍": 0x78 是另一路传感器、比核心真实温度滞后 —— 实测
+        # 100% 负载跑起来时风扇还停在 6 档, 等 EC 报 98°C 才拉满, 接着温度砸下去、风扇停、
+        # 再冲上来。两条前馈都不花 EC 事务:
+        #   ① DTS 前馈: CPU 自己的 DTS(MSR, 5 秒一读、反应快)到 fan.dts_max_c 就立刻拉满;
+        #   ② 负载前馈: 持续占用 >= load_boost_pct 满 load_boost_s 秒 -> 至少 load_boost_level
+        #      (计时在 tick 里按 5 秒粒度做, 传进来的 boost 就是结论)。
         lvl = int(f.get('load_boost_level') or 0)
-        if lb > 0 and lvl > 0 and load is not None:
-            if load >= lb:
-                if _FAN.get('hi_since') is None:
-                    _FAN['hi_since'] = time.time()
-                if time.time() - _FAN['hi_since'] >= float(f.get('load_boost_s') or 20.0):
-                    _FAN['boost_until'] = time.time() + float(f.get('load_hold_s') or 30.0)
-            else:
-                _FAN['hi_since'] = None
-            if _FAN.get('boost_until') and time.time() < _FAN['boost_until']:
-                if lvl > want:
-                    want, boosted = lvl, True
+        if dts is not None and dts >= float(f.get('dts_max_c') or 92.0) and want < FAN_MAX:
+            want, boosted = FAN_MAX, True
+        elif boost and lvl > 0 and lvl > want:
+            want, boosted = lvl, True
     cur = ec_hfsp()
     if cur is None:
         return None
@@ -1171,7 +1170,9 @@ def fan_tick(cfg, temp=None, force_max=False, load=None, force_why=None):
     gap = float(f.get('min_write_gap_s') or 0.0)
     cur_lv = _FAN.get('lv')
     urgent = force_max or (temp is not None and temp >= guard_cfg(cfg)['warn_c'])
-    if (gap > 0 and not urgent and cur_lv is not None and _FAN.get('t')
+    # 只压"往低档退", 升档(降温方向)永不延迟 —— 2026-10-19 两次压测后改: 前馈/曲线要升档时
+    # 被节流掉就失去意义了。
+    if (gap > 0 and not urgent and cur_lv is not None and want < cur_lv and _FAN.get('t')
             and (time.time() - _FAN['t']) < gap):
         _FAN['idx'] = idx
         return _note_once('fan_gap_%d_%d' % (cur_lv, want),
@@ -1185,9 +1186,15 @@ def fan_tick(cfg, temp=None, force_max=False, load=None, force_why=None):
     if _FAN.get('lv') != got:
         _FAN['t'] = t0                      # 档位真的变了 -> 驻留计时从这里起算
     _FAN['lv'] = got
-    why = (' (%s)' % (force_why or '过热保护') if force_max and mode != 'max' else
-           (' (负载前馈 %.0f%%)' % load if boosted and load is not None else
-            (' (%d°C)' % temp if (idx is not None and temp is not None) else '')))
+    if force_max and mode != 'max':
+        why = ' (%s)' % (force_why or '过热保护')
+    elif boosted and dts is not None and dts >= float(f.get('dts_max_c') or 92.0):
+        why = ' (DTS 前馈 %d°C)' % dts
+    elif boosted:
+        why = (' (负载前馈 %.0f%%)' % load) if load is not None else ' (负载前馈)'
+    else:
+        why = ' (%d°C)' % temp if (idx is not None and temp is not None) else ''
+    why = why if isinstance(why, str) else ''   # 保险: 上面分支写错也不会让日志炸掉
     return '风扇: %s -> %s%s' % (fan_name(cur), fan_name(got), why)
 
 
@@ -1470,6 +1477,19 @@ def tick(cfg=None, ec=True, read_flags=True):
     except Exception:
         dts = None
     load = cpu_load_pct()          # 每轮都采(不碰 EC/不开句柄), 给风扇前馈用
+    # 负载前馈的计时放在这里(5 秒粒度; 放在 fan_tick 里只有 EC 的 15 秒粒度, 两次压测实测太慢)
+    _fc = fan_cfg(cfg)
+    _lbp = float(_fc.get('load_boost_pct') or 0.0)
+    boost = False
+    if _lbp > 0 and load is not None:
+        if load >= _lbp:
+            if _FAN.get('hi_since') is None:
+                _FAN['hi_since'] = time.time()
+            if time.time() - _FAN['hi_since'] >= float(_fc.get('load_boost_s') or 10.0):
+                _FAN['boost_until'] = time.time() + float(_fc.get('load_hold_s') or 30.0)
+        else:
+            _FAN['hi_since'] = None
+        boost = bool(_FAN.get('boost_until') and time.time() < _FAN['boost_until'])
     flags = _G.get('last_flags') or {}
     fresh = bool(ec and read_flags)
     if fresh:
@@ -1494,7 +1514,7 @@ def tick(cfg=None, ec=True, read_flags=True):
         force = bool(g.get('force_fan_max', True)) and (
             _G['level'] in ('warn', 'crit', 'trip', 'escape', 'flag') or tail)
         try:
-            n = fan_tick(cfg, et, force_max=force, load=load,
+            n = fan_tick(cfg, et, force_max=force, load=load, dts=dts, boost=boost,
                          force_why='过热保护尾部' if tail and _G['level'] is None else None)
             if n:
                 notes.append(n)

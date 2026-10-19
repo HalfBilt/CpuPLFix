@@ -10,7 +10,8 @@
     CpuPLFixCfg.py gmin=30 保护最短驻留秒数 / rel=10 解除驻留秒数
     CpuPLFixCfg.py boost=70,20,64 负载前馈：占用>=70% 满 20 秒 -> 至少满速
     CpuPLFixCfg.py boost_hold=30 负载落下后再吹 30 秒
-    CpuPLFixCfg.py fgap=10 非紧急风扇写入的最小间隔（秒）
+    CpuPLFixCfg.py fgap=10 非紧急风扇写入的最小间隔（只压降档，秒）
+    CpuPLFixCfg.py fan_dts=92 DTS 前馈：核心温度到 92°C 立刻拉满风扇
     CpuPLFixCfg.py flag_slow=120 凉机时固件标志读的间隔（秒）
     CpuPLFixCfg.py cool_tail=30 退出过热保护后继续满速 30 秒
     CpuPLFixCfg.py undo        撤销上一次保存
@@ -116,7 +117,9 @@ def show(cfg):
              cfg['fan'].get('load_boost_level', 64)))
     print('  boost_hold=%g       负载落下后再吹这么久（秒）'
           % cfg['fan'].get('load_hold_s', 30.0))
-    print('  fgap=%g            非紧急风扇写入的最小间隔（秒，0=关）'
+    print('  fan_dts=%g         DTS(核心温度)到它就立刻拉满（0=关；比 EC 0x78 快）'
+          % cfg['fan'].get('dts_max_c', 92.0))
+    print('  fgap=%g            非紧急风扇写入的最小间隔（只压降档，秒，0=关）'
           % cfg['fan'].get('min_write_gap_s', 10.0))
     print()
     print('【过热保护】%s' % onoff(g['enabled']))
@@ -281,6 +284,8 @@ def apply_kv(cfg, key, val):
         f['load_boost_level'] = _num(c, 0, 64, '前馈档位', integer=True, allow_zero=True)
     elif k == 'boost_hold':
         f['load_hold_s'] = _num(val, 0, 600, '前馈尾巴秒数', allow_zero=True)
+    elif k == 'fan_dts':
+        f['dts_max_c'] = _num(val, 0, 120, 'DTS 前馈阈值（0=关）', allow_zero=True)
     elif k == 'fgap':
         f['min_write_gap_s'] = _num(val, 0, 300, '风扇写入最小间隔秒数（0=关）', allow_zero=True)
     elif k == 'flag_slow':
