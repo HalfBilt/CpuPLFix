@@ -4,6 +4,8 @@
     CpuPLFixCfg.py             看当前配置
     CpuPLFixCfg.py ac=40,55    改插电 PL1/PL2
     CpuPLFixCfg.py fan=56,79,5 改风扇曲线边界 + 回差
+    CpuPLFixCfg.py hold=180 改固件标志锁存判定秒数（0=关掉这条出口）
+    CpuPLFixCfg.py dwell=60 降温降档最短驻留秒数（0=关）
     CpuPLFixCfg.py undo        撤销上一次保存
     CpuPLFixCfg.py raw         打印完整 JSON
 
