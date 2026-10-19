@@ -65,8 +65,12 @@ echo ----------------------------------------------------------
 echo.
 echo Done. The next EC report line needs about 5-6 minutes.
 echo How to confirm THIS build is live (the wait value no longer tells you):
-echo   - 2-check prints "fan 6 (.3880 RPM)" instead of the old 3490 label
+echo   - 2-check prints the fan level label with 3880 RPM (not the old 3490)
 echo   - fan write problems now say either "write failed" or "readback not confirmed"
+echo   - the health line now reads "EC bus: ... N transactions ... collisions ..."
+echo     (new wording; it counts transactions, not read decisions)
+echo   - a NON-admin "2-check" can now OPEN the two named mutexes (DACL fixed:
+echo     service used to create them as SYSTEM, so user-level tools got err=5)
 echo   - a new "===== ... svc =====" block appears in fix.log after the restart
 echo.
 pause

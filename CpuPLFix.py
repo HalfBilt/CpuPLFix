@@ -727,6 +727,9 @@ IOCTL_WRITE_PORT = 0x80006434
 EC_CTRL, EC_DATA = 0x66, 0x62
 EC_HFSP, EC_TEMP, EC_RPM_LO, EC_RPM_HI = 0x2F, 0x78, 0x84, 0x85
 EC_FSEL_LEGACY = 0x31      # 老 IBM/X60 那代用它选"主/副风扇"(bit0); 本机不是, 见 ec_rpm()
+# ★2026-10-19: 老机型兜底开关。本机**关**(见 ec_rpm() 里的说明) —— 手册 03 §5.1/§5.4
+#   写着"工具不写 0x31", 代码以前却在 ec_rpm() 的兜底路径里写它, 自相矛盾。
+EC_LEGACY_FSEL = False
 EC_TEMP_EXTRA = (0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0xC9)   # TTS1/TTS6/TTS2/TTS3/TTS4/HWAT
 FAN_AUTO, FAN_MAX = 0x80, 0x40
 # ★2026-10-19: 6 档改成实测 3880(原来 3490 是从别的项目抄的 —— 同一行日志会印成
@@ -739,9 +742,13 @@ FAN_LEVEL_RPM = {1: 2480, 2: 2610, 3: 2720, 4: 3190, 5: 3185, 6: 3880, 7: 3880, 
 #   注意: 它跟温度寄存器 0x78 的读数无关 —— 0x78 只是给 OS 看的温度(而且 0x80 是
 #   "无效"哨兵值, AML 会把它当成 48°C)。2026-10-18 那次强制休眠就是这几个标志触发的。
 #   ⚠️ 只有这三个! 0x88(TSL0/TSR0) **不**参与 _TMP 的判据(它只被 _WAK/_Q40 用来挑热表),
-#      2026-10-18 实测本机 0x88 常驻 0x40(bit6), 属正常, 别当成"过热"。
+#      2026-10-18 实测本机 0x88 是 0x40(bit6), 但 2026-10-19 断电复位后变成 0x00 ——
+#      它**会变**, 属正常, 别当成"过热"。
 EC_TRIP_FLAGS = (0x89, 0x8A, 0x8B)
 EC_TEMP_SENTINEL = 0x80        # 0x78 读到这个值 = 传感器给了无效码
+# ★2026-10-19: ec_temp() 把 0x80 当"读失败"滤掉了(out of range), 于是 tick() 里那个
+#   "读到无效码"的提示**永远不会触发**(死代码)。这里留个标志位把它接回去。
+_EC_TEMP_SENTINEL_SEEN = False
 
 
 def _port_call(code, inbuf, outlen):
@@ -812,22 +819,113 @@ _ec_mx_peer = None
 _ec_peer_held = False
 
 
+_MX_SDDL = 'D:(A;;0x00100001;;;WD)'      # Everyone: SYNCHRONIZE(0x100000)|MUTEX_MODIFY_STATE(0x1)
+_DACL_SECURITY_INFORMATION = 0x00000004
+
+# ★★2026-10-19 复核(重要): 命名互斥体默认继承**创建者**的默认 DACL。
+#   本机看守服务以 SYSTEM 身份创建这两个名字 -> 普通用户进程 CreateMutexW / OpenMutexW
+#   一律 ERROR_ACCESS_DENIED(实测: SYNCHRONIZE / MUTEX_MODIFY_STATE / 两者 / ALL_ACCESS
+#   四种组合全是 err=5; 对照组: 用户进程自己建的名字, 另一个用户进程立刻就能打开)。
+#   后果有两层:
+#     ① 2-check / fan 命令 / 13-EC诊断 / 15-EC延时对照 这些**用户级**工具一把锁都拿不到
+#        -> _ec_lock() 直接返回 False -> 它们**完全不加锁**地和看守服务抢同一对端口,
+#        正是 03 §4 说的插队场景(手册里"跨进程互斥"这条保险对本机其实是失效的);
+#     ② 我们抢先创建的"行业通用那把"(Access_EC)还会让 HWiNFO 之类用户级程序**开不了它**
+#        -> 同行锁不但没保护, 反而可能打断别人自己的锁。
+#   对策: 显式给一把 "Everyone: SYNCHRONIZE|MUTEX_MODIFY_STATE" 的 DACL;
+#   已经存在的那两个是本服务建的(= 本服务是所有者, 有权改 DACL)顺手改回来。
+try:
+    adv.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = ctypes.c_long
+    adv.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        w.LPCWSTR, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p, ctypes.c_void_p]
+    adv.SetKernelObjectSecurity.restype = ctypes.c_long
+    adv.SetKernelObjectSecurity.argtypes = [w.HANDLE, ctypes.c_uint32, ctypes.c_void_p]
+    k32.LocalFree.restype = ctypes.c_void_p
+    k32.LocalFree.argtypes = [ctypes.c_void_p]
+except Exception:
+    pass
+
+
+class _SECURITY_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [('nLength', ctypes.c_uint32), ('lpSecurityDescriptor', ctypes.c_void_p),
+                ('bInheritHandle', w.BOOL)]
+
+
+def _mx_sddl_sd():
+    """把 _MX_SDDL 变成自相对安全描述符(调用方负责 LocalFree)。失败返回 None。"""
+    try:
+        sd = ctypes.c_void_p()
+        if not adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                _MX_SDDL, 1, ctypes.byref(sd), None, None):
+            return None
+        return sd
+    except Exception:
+        return None
+
+
+def _mx_fix_dacl(h):
+    """把已存在的互斥体 DACL 改成"普通用户也能同步+改状态"。失败不致命。
+
+    用 SetKernelObjectSecurity(内核对象 + **自相对**安全描述符)。
+    注意: SetSecurityInfo 那条路要的是绝对格式的 DACL, 喂自相对 SD 会返回 1336。
+    权限: 句柄要有 WRITE_DAC —— 创建者(=所有者)隐式就有, 所以本服务改自己建的那两个没问题。
+    """
+    sd = _mx_sddl_sd()
+    if sd is None:
+        return False
+    try:
+        return bool(adv.SetKernelObjectSecurity(h, _DACL_SECURITY_INFORMATION, sd))
+    except Exception:
+        return False
+    finally:
+        try:
+            k32.LocalFree(sd)
+        except Exception:
+            pass
+
+
 def _mx_handle(slot, name):
-    """取(必要时创建)命名互斥体句柄, 缓存到模块全局; 失败返回 False。"""
+    """取(必要时创建)命名互斥体句柄, 缓存到模块全局; 失败返回 False。
+
+    2026-10-19: 显式带一份"Everyone 可同步+改状态"的 DACL 去创建, 并把已存在的那个
+    的 DACL 修回来 —— 否则服务(SYSTEM)先创建的话, 用户级进程一把锁都拿不到。
+    """
     g = globals()
     h = g.get(slot)
     if h is None:
+        sd = _mx_sddl_sd()
         try:
-            k32.CreateMutexW.restype = w.HANDLE
-            k32.CreateMutexW.argtypes = [ctypes.c_void_p, w.BOOL, w.LPCWSTR]
-            h = k32.CreateMutexW(None, False, name)
+            sa = None
+            if sd is not None:
+                sa = _SECURITY_ATTRIBUTES()
+                sa.nLength = ctypes.sizeof(sa)
+                sa.lpSecurityDescriptor = sd
+                sa.bInheritHandle = False
+            try:
+                k32.CreateMutexW.restype = w.HANDLE
+                k32.CreateMutexW.argtypes = [ctypes.c_void_p, w.BOOL, w.LPCWSTR]
+                h = k32.CreateMutexW(ctypes.byref(sa) if sa is not None else None, False, name)
+            except Exception:
+                h = None
             if not h:
-                k32.OpenMutexW.restype = w.HANDLE
-                k32.OpenMutexW.argtypes = [w.DWORD, w.BOOL, w.LPCWSTR]
-                h = k32.OpenMutexW(0x00100000 | 0x0001, False, name)  # MUTEX_MODIFY_STATE|SYNCHRONIZE
+                try:
+                    k32.OpenMutexW.restype = w.HANDLE
+                    k32.OpenMutexW.argtypes = [w.DWORD, w.BOOL, w.LPCWSTR]
+                    h = k32.OpenMutexW(0x00100000 | 0x0001, False, name)  # MUTEX_MODIFY_STATE|SYNCHRONIZE
+                except Exception:
+                    h = None
             h = h or False
         except Exception:
             h = False
+        finally:
+            if sd is not None:
+                try:
+                    k32.LocalFree(sd)
+                except Exception:
+                    pass
+        if h:
+            _mx_fix_dacl(h)       # 已存在的那个可能带着旧 DACL -> 改回来
         g[slot] = h
     return h
 
@@ -877,23 +975,33 @@ def _ec_unlock(locked):
             pass
 
 
+def _ec_fail():
+    """一笔 EC 读事务失败(读不出/命令写失败)。记一次"读失败", 返回 None。"""
+    _ECBUS['hard'] = _ECBUS.get('hard', 0) + 1
+    return None
+
+
 def ec_read(off, _locked=False, delay=0.003):
     """读一个 EC 寄存器(失败返回 None)。delay = 写完偏移后等 EC 应答的时间(秒)"""
     locked = _ec_lock() if not _locked else True
+    # ★2026-10-19: 事务计数。体检行以前拿"读判定次数"当分母, 而读判定只有严格读
+    #   (固件标志)才会计 —— 温度/档位那些普通读一次都不计, 于是那个"串位率"既不是
+    #   事务级、也没覆盖真正喂风扇曲线的那几笔。现在按**事务**计数, 分母才稳。
+    _ECBUS['tx'] = _ECBUS.get('tx', 0) + 1
     try:
         _ec_drain()
         if not _ec_wait(True):
-            return None
+            return _ec_fail()
         if not wr_port(EC_CTRL, 0x80):      # ★2026-10-19: 原来丢掉返回值 —— 写失败也照样往下走
             ec_bus_stat(True)
-            return None
+            return _ec_fail()
         if not _ec_wait(False):
-            return None
+            return _ec_fail()
         if not wr_port(EC_DATA, off):
             ec_bus_stat(True)
-            return None
+            return _ec_fail()
         if not _ec_wait(False):
-            return None
+            return _ec_fail()
         # 等 EC 把结果放进输出缓冲。EC 忙(满载时它自己在管风扇/热区)时不会立刻应答,
         # 不等就直接读, 读到的往往是别的主控留在缓冲里的残留字节 —— 实测满载扫描时
         # 一次"读 0x8A"读到的是 0x7A 的值(46), 而且连读两次都是这个残留值。
@@ -903,6 +1011,7 @@ def ec_read(off, _locked=False, delay=0.003):
         v = rd_port(EC_DATA)
         if v is None:
             ec_bus_stat(True)
+            return _ec_fail()
         return v
     finally:
         if not _locked:
@@ -925,6 +1034,11 @@ def ec_read_ok(off, tries=3):
         v = ec_read(off, delay=delays[min(i, len(delays) - 1)])
         if v is not None and prev is not None and v == prev:
             return v
+        if v is not None and prev is not None:
+            # ★2026-10-19: 两次读出的值不同 = 这两笔里有一笔被插队了(温度/转速是慢变量,
+            #   5 ms 内不可能变)。以前这里只是默默继续重试, 于是"普通读"的撞车**完全没进账**
+            #   —— 体检行的"串位率"只统计得到"读失败"和"哨兵不符", 少算一大半。
+            _ECBUS['soft'] = _ECBUS.get('soft', 0) + 1
         prev = v
         if i + 1 < max(2, tries):
             time.sleep(0.005)       # ★重试之间也给 EC 喘口气(2026-10-19)
@@ -960,7 +1074,10 @@ EC_MAX_DELAY = 0.004            # 上限等待: 实测 6ms 起急剧恶化, 所�
 EC_RETRY_DELAYS = (EC_BASE_DELAY, EC_MAX_DELAY, EC_MAX_DELAY)
 EC_DECAY_S = 60.0               # 距上次串位超过这么久 -> 等待直接回基准
 _ECBUS = {'ok': 0, 'bad': 0, 'retry': 0, 'settle': EC_BASE_DELAY, 'clean': 0, 'pending': False,
-          't0': None, 'win_s': 0.0, 'last_report': 0.0, 'last_bad': 0.0}
+          't0': None, 'win_s': 0.0, 'last_report': 0.0, 'last_bad': 0.0,
+          # ★2026-10-19: 事务级计数(tx / hard / soft / canary)—— 体检行的分母改成"笔事务",
+          #   这样不同判定类型(普通读 2~3 笔 vs 严格读 6~9 笔)混在一起也不会让百分比失真。
+          'tx': 0, 'hard': 0, 'soft': 0, 'canary': 0}
 ECBUS_REPORT_EVERY = 30         # 30 次读判定一行(约 5 分钟) —— 便于盯"修好了没有"
 
 
@@ -1014,9 +1131,11 @@ def ec_bus_stat(hit_bad, retry=False):
 
 
 def ec_bus_stats():
-    """(事务数, 串位数, 等待毫秒, 值变动重读数) —— 给 2-check 显示。"""
-    return (_ECBUS['ok'] + _ECBUS['bad'], _ECBUS['bad'], _ECBUS['settle'] * 1000.0,
-            _ECBUS['retry'])
+    """(事务数, 撞车数, 等待毫秒, 读失败数) —— 给 2-check 显示。"""
+    hard = _ECBUS.get('hard') or 0
+    soft = _ECBUS.get('soft') or 0
+    can = _ECBUS.get('canary') or 0
+    return (_ECBUS.get('tx') or 0, hard + soft + can, _ECBUS['settle'] * 1000.0, hard)
 
 
 def ec_bus_report():
@@ -1025,22 +1144,33 @@ def ec_bus_report():
     说人话: 这里数的是"一次读判定"(一次判定=1~9 次端口事务), 窗口很短时行里的
     "次/分钟"会很大 —— 那是失败快速重试的风暴(已加刹车), 不是真的在刷 EC。
     ★2026-10-19 起即使 0 串位也会出这一行: "0 串位"本身就是"修好了"的证据, 得看得见。
+    ★2026-10-19: 分母改成**笔事务**(tx), 撞车率 = (读失败+值变动+哨兵不符)/事务数。
+      以前那个"读判定次数"当分母有两处毛病: ① 判定里混着 2~3 笔的普通读和 6~9 笔的
+      严格读, 比例一变百分比就变; ② 普通读(温度/档位)根本不计数, 真正喂风扇曲线
+      的那几笔撞车全漏了。现在按事务算, 跨时段/跨模式都能比。
     """
     if not _ECBUS['pending']:
         return None
-    n_ok, n_bad, n_re = _ECBUS['ok'], _ECBUS['bad'], _ECBUS['retry']
+    n_ok, n_bad = _ECBUS['ok'], _ECBUS['bad']
+    n_tx = _ECBUS.get('tx') or 0
+    n_hard = _ECBUS.get('hard') or 0
+    n_soft = _ECBUS.get('soft') or 0
+    n_can = _ECBUS.get('canary') or 0
     win = float(_ECBUS.get('win_s') or 0.0)
     _ECBUS['ok'] = _ECBUS['bad'] = _ECBUS['retry'] = 0
+    _ECBUS['tx'] = _ECBUS['hard'] = _ECBUS['soft'] = _ECBUS['canary'] = 0
     _ECBUS['pending'] = False
     if (time.time() - (_ECBUS.get('last_report') or 0.0)) < 60.0:
         return None                       # 限频: 风暴时别刷屏
     _ECBUS['last_report'] = time.time()
-    # ★2026-10-19: 不再"没串位就不报"(老写法: if not n_bad and not n_re: return None)。
-    return ('EC 总线体检: 最近 %d 次读判定 / %.1f 秒 —— 串位 %d 次(%.1f%%) / 值变动重读 %d 次, '
-            '等待 %.1f ms —— EC 与系统 ACPI EC 驱动/固件共用 0x62/0x66, 等待越长越容易被插队'
+    hits = n_hard + n_soft + n_can
+    # ★2026-10-19 起即使 0 串位也会出这一行: "0 串位"本身就是"修好了"的证据, 得看得见。
+    return ('EC 总线体检: 最近 %d 笔事务 / %.1f 秒 —— 撞车 %d 次(%.1f%%) '
+            '[读失败 %d / 值变动 %d / 哨兵不符 %d], 等待 %.1f ms —— '
+            'EC 与系统 ACPI EC 驱动/固件共用 0x62/0x66, 等待越长越容易被插队'
             '(见 03 §4); 关键读已用哨兵挡住'
-            % (n_ok + n_bad, win, n_bad, 100.0 * n_bad / max(1, n_ok + n_bad), n_re,
-               _ECBUS['settle'] * 1000.0))
+            % (n_tx, win, hits, 100.0 * hits / max(1, n_tx),
+               n_hard, n_soft, n_can, _ECBUS['settle'] * 1000.0))
 
 
 def ec_read_strict(off, tries=3):
@@ -1058,6 +1188,7 @@ def ec_read_strict(off, tries=3):
         c2 = ec_read(EC_CANARY[0], delay=d)
         good = (c1 == EC_CANARY[1] and c2 == EC_CANARY[1] and v is not None)
         if not good:
+            _ECBUS['canary'] = _ECBUS.get('canary', 0) + 1
             ec_bus_stat(True)
             time.sleep(0.010)
             prev = None
@@ -1067,6 +1198,8 @@ def ec_read_strict(off, tries=3):
             return v
         # 哨兵对、但两次读出来的值不一样: 对动态寄存器(温度/转速)属正常, 只记一次"重试";
         # 对关键读(会用这个值去动手的)仍然要求两次一致才返回 —— 所以这里照样再来一遍。
+        if prev is not None:
+            _ECBUS['soft'] = _ECBUS.get('soft', 0) + 1
         ec_bus_stat(False, retry=(prev is not None))
         prev = v
     return None
@@ -1104,7 +1237,11 @@ def ec_hfsp():
 def ec_temp():
     """EC 温度寄存器(°C)。有效范围 0~127（0x80 是固件的"无效"哨兵值, AML 会把它当成 48°C）。
     本机实测: 空闲 49~57, 40W 满载+满速风峰值 ~92。出界当读失败。"""
+    global _EC_TEMP_SENTINEL_SEEN
+    _EC_TEMP_SENTINEL_SEEN = False
     v = ec_read_ok(EC_TEMP)
+    if v == EC_TEMP_SENTINEL:
+        _EC_TEMP_SENTINEL_SEEN = True
     return v if (v is not None and 0 <= v <= 127) else None
 
 
@@ -1180,8 +1317,13 @@ def ec_rpm(tries=2):
         need = max(1, int(tries))
         for i in range(need + 1):
             if i == need:
-                # 哨兵校验全失败: 退回老机型做法试最后一次(本机 0x31 bit0/1 是保留位)
-                ec_write(EC_FSEL_LEGACY, 0, _locked=True)
+                # ★2026-10-19 复核: 老机型兜底(写 0x31 选主/副风扇)在本机**不该跑** ——
+                #   手册 03 §5.1/§5.4、05 §3、06 §1 都写着"工具不写 0x31", 而本机 0x31
+                #   平时是 0x40(VPON 置位), 写 0 会把 VPON 清掉。而"哨兵连续两轮都失败"
+                #   在本机并不罕见(单笔污染 ~10% 时约 12% 的概率) —— 等于每十几次读转速
+                #   就写一次 0x31。改成默认关; 要兼容别的机型再把 EC_LEGACY_FSEL 打开。
+                if EC_LEGACY_FSEL:
+                    ec_write(EC_FSEL_LEGACY, 0, _locked=True)
                 ec_bus_stat(True)
             c1 = ec_read(EC_CANARY[0], _locked=True)
             lo = ec_read(EC_RPM_LO, _locked=True)
@@ -1683,9 +1825,28 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
         if step != int(_G.get('step') or 0) or not prev:
             _G['step'] = step
             _G['step_since'] = now
-            _G['why'] = why or _G.get('why') or '温度'
+        if why:
+            # ★2026-10-19: "为什么"以**本轮**为准。原来只在"换级"时更新, 于是"温度线已经
+            #   在 crit 档、固件标志这时才置位"这一路, _G['why'] 还是旧的'温度' ——
+            #   下面"标志触发时取更严的一档"(clamp)就不会生效, 手册 02 §4.1 那条规则落空。
+            _G['why'] = why
         lv = WS[step - 1]        # ★无论有没有换级, 等级都要对齐到当前级
     if lv == _G['level']:
+        # ★2026-10-19: 等级没变、但"为什么"变了(温度线已在 crit, 固件标志这时才置位):
+        #   标志档要求"取更严的一档"(默认 20/28W), 这里补一次重设, 否则会一直停在 28/35W。
+        if lv in ('crit', 'crit2', 'crit3') and _G.get('why') == '固件标志' and _PL_OVERRIDE:
+            st = {'crit': 1, 'crit2': 2, 'crit3': 3}.get(lv, 1)
+            p1 = float((g.get('crit_pl1_w') if st == 1 else g.get('crit%d_pl1_w' % st)) or 28.0)
+            p2 = float((g.get('crit_pl2_w') if st == 1 else g.get('crit%d_pl2_w' % st)) or 35.0)
+            fp1 = float(g.get('flag_pl1_w') or 20.0)
+            fp2 = float(g.get('flag_pl2_w') or 28.0)
+            tgt = (min(p1, fp1), min(p2, fp2))
+            cur = _PL_OVERRIDE
+            if cur[0] > tgt[0] + 0.01 or cur[1] > tgt[1] + 0.01:
+                set_pl_override(tgt[0], tgt[1])
+                return ('过热保护[固件标志]: 等级不变(%s)但固件标志要求更严的功耗档 —— '
+                        '功耗墙收到 PL1=%.0fW/PL2=%.0fW(原来 %.0fW/%.0fW), 风扇满速'
+                        % (lv, tgt[0], tgt[1], cur[0], cur[1]))
         return None
     _G['level'] = lv
     _G['since'] = now
@@ -1855,7 +2016,7 @@ def tick(cfg=None, ec=True, read_flags=True):
         except Exception:
             flags = _G.get('last_flags') or {}
             fresh = False
-    if ec and et == EC_TEMP_SENTINEL:
+    if ec and _EC_TEMP_SENTINEL_SEEN:
         notes.append('注意: EC 温度寄存器(0x78)读到无效码 0x80 —— 固件的 ACPI 热区'
                      '会把它当成 48°C(0x30), 属于传感器异常, 别当真温度')
     n = guard_apply(cfg, et, dts, flags, flags_fresh=fresh)
@@ -2155,7 +2316,7 @@ def cmd_check():
                 % (_pad('CPU 占用', 26), _l2, _lb.get('load_boost_pct', 70.0),
                    _lb.get('load_boost_s', 20.0), _lb.get('load_boost_level', 64)))
         _n, _b, _ms, _re = ec_bus_stats()
-        out('%s 本进程事务 %d 次 / 串位 %d 次 / 值变动重读 %d 次, 当前自适应等待 %.1f ms'
+        out('%s 本进程事务 %d 次 / 撞车 %d 次 / 读失败 %d 次, 当前自适应等待 %.1f ms'
             % (_pad('EC 总线', 26), _n, _b, _re, _ms))
         out('%s %s' % (_pad('风扇模式', 26), '%s   (config.json -> fan.mode)' % f.get('mode')))
         if str(f.get('mode')).lower() == 'curve':

@@ -8,7 +8,7 @@
     CpuPLFixCfg.py dwell=60 降温降档最短驻留秒数（0=关）
     CpuPLFixCfg.py flag_pl=20,28 标志置位但温度正常时的 PL1,PL2（默认=预警档，不砍到 10W）
     CpuPLFixCfg.py gmin=30 保护最短驻留秒数 / rel=10 解除驻留秒数
-    CpuPLFixCfg.py boost=70,20,64 负载前馈：占用>=70% 满 20 秒 -> 至少满速
+    CpuPLFixCfg.py boost=70,10,64 负载前馈：占用>=70% 满 10 秒 -> 至少满速
     CpuPLFixCfg.py boost_hold=30 负载落下后再吹 30 秒
     CpuPLFixCfg.py fgap=10 非紧急风扇写入的最小间隔（只压降档，秒）
     CpuPLFixCfg.py fan_dts=92 DTS 前馈：核心温度到 92°C 立刻拉满风扇
@@ -36,7 +36,9 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 CFG = os.path.join(BASE, 'config.json')
 BAK = CFG + '.bak'
 
-FAN_RPM = {1: 2480, 2: 2610, 3: 2720, 4: 3190, 5: 3185, 6: 3490, 7: 3880, 64: 5000}
+# ★2026-10-19: 6 档从抄错的 3490 改成实测 3880(和 CpuPLFix.FAN_LEVEL_RPM 对齐)。
+#   1~5/7 档仍是抄来的旧值、本机未标定 —— 只影响显示, 不影响控制。
+FAN_RPM = {1: 2480, 2: 2610, 3: 2720, 4: 3190, 5: 3185, 6: 3880, 7: 3880, 64: 5000}
 
 
 # ---------------------------------------------------------------- 读写
@@ -120,7 +122,7 @@ def show(cfg):
     print('  dwell=%g           降温降档最短驻留（秒，0=关）'
           % cfg['fan'].get('min_dwell_s', 60.0))
     print('  boost=%g,%g,%g      负载前馈：占用>=x%% 满 y 秒 -> 至少 z 档（64=满速；x=0 关）'
-          % (cfg['fan'].get('load_boost_pct', 70.0), cfg['fan'].get('load_boost_s', 20.0),
+          % (cfg['fan'].get('load_boost_pct', 70.0), cfg['fan'].get('load_boost_s', 10.0),
              cfg['fan'].get('load_boost_level', 64)))
     print('  boost_hold=%g       负载落下后再吹这么久（秒）'
           % cfg['fan'].get('load_hold_s', 30.0))
