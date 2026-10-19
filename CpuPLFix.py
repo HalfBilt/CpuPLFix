@@ -729,7 +729,9 @@ EC_HFSP, EC_TEMP, EC_RPM_LO, EC_RPM_HI = 0x2F, 0x78, 0x84, 0x85
 EC_FSEL_LEGACY = 0x31      # 老 IBM/X60 那代用它选"主/副风扇"(bit0); 本机不是, 见 ec_rpm()
 EC_TEMP_EXTRA = (0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0xC9)   # TTS1/TTS6/TTS2/TTS3/TTS4/HWAT
 FAN_AUTO, FAN_MAX = 0x80, 0x40
-FAN_LEVEL_RPM = {1: 2480, 2: 2610, 3: 2720, 4: 3190, 5: 3185, 6: 3490, 7: 3880, 64: 5000}
+# ★2026-10-19: 6 档改成实测 3880(原来 3490 是从别的项目抄的 —— 同一行日志会印成
+#   "6 档(约 3490 RPM) 3875RPM", 自己跟自己差 400 转)。1~5/7 档本机还没有可信标定, 先留旧值。
+FAN_LEVEL_RPM = {1: 2480, 2: 2610, 3: 2720, 4: 3190, 5: 3185, 6: 3880, 7: 3880, 64: 5000}
 
 # 固件"热到要强制休眠"的真实判据(来自本机 DSDT 里 \_TZ.THM0._TMP 的反汇编):
 #   这三个寄存器任一的低 7 位非零 -> _TMP 立刻返回 _HOT(=TCRT-1=401K≈127.9°C),
@@ -799,40 +801,75 @@ def _ec_wait(clear_obf, timeout=1.0):
 
 
 EC_MUTEX_NAME = 'Global\\CpuPLFix-EC'
+# ★2026-10-19: 再拿一把"行业通用"的 EC 锁。HWiNFO / AIDA64 / LibreHardwareMonitor 都用
+#   'Global\\Access_EC' 这个名字串行化 EC 端口访问 —— 它们**不认识**我们自己那把
+#   'Global\\CpuPLFix-EC'。装了 HWiNFO 并常驻时, 它每秒一次的 EC 轮询会直接插进我们的
+#   事务窗口里(本机实测: 串位就是"别的主控插进来做完它那一笔, 把输出缓冲覆盖掉")。
+#   尽力而为: 拿不到就照旧干活, 只是退回"和对家赛跑"(原来的行为)。
+EC_MUTEX_PEER = 'Global\\Access_EC'
 _ec_mx = None
+_ec_mx_peer = None
+_ec_peer_held = False
+
+
+def _mx_handle(slot, name):
+    """取(必要时创建)命名互斥体句柄, 缓存到模块全局; 失败返回 False。"""
+    g = globals()
+    h = g.get(slot)
+    if h is None:
+        try:
+            k32.CreateMutexW.restype = w.HANDLE
+            k32.CreateMutexW.argtypes = [ctypes.c_void_p, w.BOOL, w.LPCWSTR]
+            h = k32.CreateMutexW(None, False, name)
+            if not h:
+                k32.OpenMutexW.restype = w.HANDLE
+                k32.OpenMutexW.argtypes = [w.DWORD, w.BOOL, w.LPCWSTR]
+                h = k32.OpenMutexW(0x00100000 | 0x0001, False, name)  # MUTEX_MODIFY_STATE|SYNCHRONIZE
+            h = h or False
+        except Exception:
+            h = False
+        g[slot] = h
+    return h
 
 
 def _ec_lock(timeout_ms=3000):
-    """把 EC 端口事务跨进程串行化(看守服务 / 命令行 / 扫描工具都用这一把)。
+    """把 EC 端口事务跨进程串行化(看守服务 / 命令行 / 扫描工具都用这一把 + 对家那把)。
 
     实测教训: 两个进程同时做那套"写命令 0x80 -> 写偏移 -> 读数据"的四步事务时, 双方会
     互相插队, 应答错位, 读出来的是对方那次事务的字节(0x78 读成 46 而实际 82)。
     用命名互斥体(Global\\ 才能跨会话 —— 服务在 session 0, 命令行在用户会话)。
     拿不到就退化成不加锁(尽力而为), 锁本身不会让功能失效。
     """
-    global _ec_mx
-    if _ec_mx is None:
-        try:
-            k32.CreateMutexW.restype = w.HANDLE
-            k32.CreateMutexW.argtypes = [ctypes.c_void_p, w.BOOL, w.LPCWSTR]
-            h = k32.CreateMutexW(None, False, EC_MUTEX_NAME)
-            if not h:
-                k32.OpenMutexW.restype = w.HANDLE
-                k32.OpenMutexW.argtypes = [w.DWORD, w.BOOL, w.LPCWSTR]
-                h = k32.OpenMutexW(0x00100000 | 0x0001, False, EC_MUTEX_NAME)  # MUTEX_MODIFY_STATE|SYNCHRONIZE
-            _ec_mx = h or False
-        except Exception:
-            _ec_mx = False
-    if not _ec_mx:
+    global _ec_peer_held
+    _ec_peer_held = False
+    h = _mx_handle('_ec_mx', EC_MUTEX_NAME)
+    if not h:
         return False
     try:
-        r = k32.WaitForSingleObject(_ec_mx, timeout_ms)
-        return r in (0x00000000, 0x00000080)      # WAIT_OBJECT_0 / WAIT_ABANDONED(上一个持有者死了)
+        r = k32.WaitForSingleObject(h, timeout_ms)
+        if r not in (0x00000000, 0x00000080):     # WAIT_OBJECT_0 / WAIT_ABANDONED(上一个持有者死了)
+            return False
     except Exception:
         return False
+    # 再拿对家那把(短超时, 拿不到就算了 —— 不能为了它把整次读卡住)
+    hp = _mx_handle('_ec_mx_peer', EC_MUTEX_PEER)
+    if hp:
+        try:
+            if k32.WaitForSingleObject(hp, 250) in (0x00000000, 0x00000080):
+                _ec_peer_held = True
+        except Exception:
+            pass
+    return True
 
 
 def _ec_unlock(locked):
+    global _ec_peer_held
+    if locked and _ec_peer_held and _ec_mx_peer:
+        try:
+            k32.ReleaseMutex(_ec_mx_peer)
+        except Exception:
+            pass
+        _ec_peer_held = False
     if locked and _ec_mx:
         try:
             k32.ReleaseMutex(_ec_mx)
@@ -847,10 +884,14 @@ def ec_read(off, _locked=False, delay=0.003):
         _ec_drain()
         if not _ec_wait(True):
             return None
-        wr_port(EC_CTRL, 0x80)
+        if not wr_port(EC_CTRL, 0x80):      # ★2026-10-19: 原来丢掉返回值 —— 写失败也照样往下走
+            ec_bus_stat(True)
+            return None
         if not _ec_wait(False):
             return None
-        wr_port(EC_DATA, off)
+        if not wr_port(EC_DATA, off):
+            ec_bus_stat(True)
+            return None
         if not _ec_wait(False):
             return None
         # 等 EC 把结果放进输出缓冲。EC 忙(满载时它自己在管风扇/热区)时不会立刻应答,
@@ -1038,13 +1079,16 @@ def ec_write(off, val, _locked=False):
         _ec_drain()
         if not _ec_wait(True):
             return False
-        wr_port(EC_CTRL, 0x81)
+        if not wr_port(EC_CTRL, 0x81):       # ★2026-10-19: 原来丢掉返回值, 写失败也返回 True
+            return False
         if not _ec_wait(False):
             return False
-        wr_port(EC_DATA, off)
+        if not wr_port(EC_DATA, off):
+            return False
         if not _ec_wait(False):
             return False
-        wr_port(EC_DATA, val)
+        if not wr_port(EC_DATA, val):
+            return False
         if not _ec_wait(False):
             return False
         return True
@@ -1113,8 +1157,15 @@ def merge_flags(new, old):
     return merged, complete
 
 
-def ec_rpm():
+def ec_rpm(tries=2):
     """风扇转速。先读 0x84 再读 0x85 —— 顺序不能反(thinkpad_acpi 记载的固件 bug)。
+
+    ★2026-10-19: 原来这里两笔都是**裸读**(没有哨兵、没有一致性校验), 插队时会把别的
+      寄存器的值当成转速 —— 日志里因此出现过 "2 档 4587 RPM"、"6 档 4491 RPM" 这种
+      离群值(真值分别是 ~2850 / ~3880), 还误导过手册的风扇表。
+      现在每一轮都是 哨兵 -> lo -> hi -> 哨兵, 前后两次 0xC9 都等于 65 才认;
+      转速再限一个 0~8000 RPM 的物理范围。代价是多几次事务, 但 ec_rpm() 只在
+      2-check / fan 命令里调, 不在服务的轮询热路径上。
 
     2026-10-18 实测: **不需要**先写 0x31。
       · 本机 DSDT 里 0x31 的位叫 HUWB(bit2)/VPON(bit6)/VRST(bit7), bit0/1 是保留位;
@@ -1125,17 +1176,27 @@ def ec_rpm():
     """
     locked = _ec_lock()
     try:
-        lo = ec_read(EC_RPM_LO, _locked=True)
-        hi = ec_read(EC_RPM_HI, _locked=True)
-        if lo is None or hi is None:
-            ec_write(EC_FSEL_LEGACY, 0, _locked=True)     # 兜底: 别的机型可能要选一下
+        need = max(1, int(tries))
+        for i in range(need + 1):
+            if i == need:
+                # 哨兵校验全失败: 退回老机型做法试最后一次(本机 0x31 bit0/1 是保留位)
+                ec_write(EC_FSEL_LEGACY, 0, _locked=True)
+                ec_bus_stat(True)
+            c1 = ec_read(EC_CANARY[0], _locked=True)
             lo = ec_read(EC_RPM_LO, _locked=True)
             hi = ec_read(EC_RPM_HI, _locked=True)
+            c2 = ec_read(EC_CANARY[0], _locked=True)
+            if c1 != EC_CANARY[1] or c2 != EC_CANARY[1] or lo is None or hi is None:
+                ec_bus_stat(True)
+                continue
+            rpm = (hi << 8) | lo
+            if 0 <= rpm <= 8000:
+                ec_bus_stat(False)
+                return rpm
+            ec_bus_stat(True)              # 物理上不可能的值: 当这次没读到
+        return None
     finally:
         _ec_unlock(locked)
-    if lo is None or hi is None:
-        return None
-    return (hi << 8) | lo
 
 
 def ec_extra_temps():
@@ -1159,9 +1220,15 @@ def ec_extra_temps():
 
 
 def set_fan(v):
-    """写风扇档位, 返回回读值(None = 失败)"""
-    ec_write(EC_HFSP, v)
-    return ec_hfsp()
+    """写风扇档位。返回 (写入是否成功, 回读值)。
+
+    ★2026-10-19: 以前这里返回的只是**回读值**, 而 ec_write 的返回值被丢掉 —— 于是
+      "写成功、只是回读被串位搞成两次不一致"也会被报成
+      "风扇: 写 0x06 失败(EC 无响应)"。日志里 10-19 的
+      16:52:54 / 17:40:35 / 18:31:11 三次全是这种情况(写其实成功了)。
+    """
+    ok = ec_write(EC_HFSP, v)
+    return ok, ec_hfsp()
 
 
 def fan_name(v):
@@ -1265,10 +1332,13 @@ def fan_tick(cfg, temp=None, force_max=False, load=None, force_why=None,
     if cur is None:
         return None
     if not _fan_ok(cur):
-        got = set_fan(want)                 # 回读不可信, 目标档照样写下去
+        ok, got = set_fan(want)             # 回读不可信, 目标档照样写下去
         _FAN['idx'] = idx
-        if got is None:
+        if not ok:
             return '风扇: 写 0x%02X 失败(EC 无响应)' % want
+        if got is None:
+            return _note_once('fan_rb_%02x' % want,
+                              '风扇: 已写 0x%02X, 但回读没确认(EC 事务串位) —— 下一轮会重试' % want)
         return _note_once('fan_junk',
                           '风扇: 档位回读异常(0x%02X, EC 事务串位) -> 已按目标重写 %s'
                           % (cur, fan_name(got)))
@@ -1292,10 +1362,13 @@ def fan_tick(cfg, temp=None, force_max=False, load=None, force_why=None,
                           '风扇: 想在 %.0f 秒内连改档(%s -> %s), 已按最小间隔 %.0f 秒节流'
                           % (gap, fan_name(cur_lv), fan_name(want), gap))
     t0 = time.time()
-    got = set_fan(want)
+    ok, got = set_fan(want)
     _FAN['idx'] = idx
-    if got is None:
+    if not ok:
         return '风扇: 写 0x%02X 失败(EC 无响应)' % want
+    if got is None:
+        return _note_once('fan_rb_%02x' % want,
+                          '风扇: 已写 0x%02X, 但回读没确认(EC 事务串位) —— 下一轮会重试' % want)
     if _FAN.get('lv') != got:
         _FAN['t'] = t0                      # 档位真的变了 -> 驻留计时从这里起算
     _FAN['lv'] = got
@@ -3003,7 +3076,10 @@ def cmd_fan(args):
         f['mode'] = 'level'
         f['level'] = n
         save_cfg(cfg)
-        got = set_fan(n)
+        ok, got = set_fan(n)
+        if not ok:
+            out('[X] 写 0x%02X 失败(EC 无响应)' % n)
+            return 1
         out('[√] 风扇固定到 %s (config: fan.mode=level, fan.level=%d)' % (fan_name(got), n))
         out('    守护服务会一直维持这个档位; 想恢复自动曲线执行 fan curve')
         return 0
