@@ -4,13 +4,25 @@ cd /d "%~dp0"
 chcp 65001 >nul
 set PYTHONIOENCODING=utf-8
 
-if not exist "%~dp0runtime\python.exe" (
-  echo [X] runtime\python.exe not found. Reinstall CpuPLFix first.
+rem Prefer the runtime next to this script (that is the deployed copy). The git repo
+rem only ships runtime.zip, so fall back to the installed copy under %APPDATA%\CpuPLFix.
+set PYBIN=%~dp0runtime\python.exe
+set CFGPY=%~dp0CpuPLFixCfg.py
+if not exist "%PYBIN%" set PYBIN=%APPDATA%\CpuPLFix\runtime\python.exe
+if not exist "%CFGPY%" set CFGPY=%APPDATA%\CpuPLFix\CpuPLFixCfg.py
+
+if not exist "%PYBIN%" (
+  echo [X] runtime\python.exe not found - run 1-install.bat first.
+  pause
+  exit /b 1
+)
+if not exist "%CFGPY%" (
+  echo [X] CpuPLFixCfg.py not found.
   pause
   exit /b 1
 )
 
-"%~dp0runtime\python.exe" "%~dp0CpuPLFixCfg.py" %*
+"%PYBIN%" "%CFGPY%" %*
 set RC=%ERRORLEVEL%
 
 rem Pause only when double-clicked; do not pause when called from a script.
