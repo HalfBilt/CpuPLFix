@@ -98,6 +98,8 @@ def show(cfg):
     print('  mode=%s        curve / max / level / ec' % cfg['fan']['mode'])
     print('  level=%s           mode=level 时用' % cfg['fan']['level'])
     print('  hyst=%g            降档回差（C）' % cfg['fan']['hyst'])
+    print('  dwell=%g           降温降档最短驻留（秒，0=关）'
+          % cfg['fan'].get('min_dwell_s', 60.0))
     print()
     print('【过热保护】%s' % onoff(g['enabled']))
     print('  guard=%g,%g,%g,%g          预警/严重/逃生/解除（C）'
@@ -109,6 +111,8 @@ def show(cfg):
     print('  guard_on=%s  ffmax=%s  trip=%s  hibernate=%s'
           % (onoff(g['enabled']), onoff(g['force_fan_max']),
              onoff(g['trip_flags']), onoff(g['escape_hibernate'])))
+    print('  hold=%g            固件标志锁存判定秒数（0=关掉这条出口）'
+          % g.get('trip_hold_s', 180.0))
     print()
     print('改值：3-config.bat ac=40,55   |   撤销：3-config.bat undo   |   全部用法：3-config.bat help')
     print()
@@ -234,6 +238,10 @@ def apply_kv(cfg, key, val):
         g['force_fan_max'] = _bool(val, 'ffmax')
     elif k == 'trip':
         g['trip_flags'] = _bool(val, 'trip')
+    elif k == 'hold':
+        g['trip_hold_s'] = _num(val, 0, 3600, '锁存判定秒数（0=关）', allow_zero=True)
+    elif k == 'dwell':
+        f['min_dwell_s'] = _num(val, 0, 600, '降档最短驻留秒数（0=关）', allow_zero=True)
     elif k == 'hibernate':
         g['escape_hibernate'] = _bool(val, 'hibernate')
     # ---- 单项简写

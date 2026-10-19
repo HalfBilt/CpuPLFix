@@ -189,7 +189,8 @@ def _worker():
         guard = cpf.guard_level() is not None
         t = cpf.last_ec_temp()
         hot = t is not None and t >= cpf.flag_hot_c(cfg)
-        poll_i, ec_i, fl_i = cpf.poll_plan(cfg, fast=fast, guard=guard, hot=hot)
+        poll_i, ec_i, fl_i = cpf.poll_plan(cfg, fast=fast, guard=guard, hot=hot,
+                                          jump=cpf.temp_jump_pending())
         do_ec = (now - last_ec) >= ec_i
         do_fl = do_ec and (now - last_fl) >= fl_i
         if do_ec:

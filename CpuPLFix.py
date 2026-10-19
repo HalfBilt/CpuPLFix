@@ -90,7 +90,10 @@ DEFAULT_CFG = {
         "level": 0,             # mode=level 时用: 1~7 是 EC 固定档, 64 是满速
         # 三档: ≤62°C 静音(2 档) / 63~75°C 平衡(6 档) / ≥76°C 强冷(满速)
         "curve": [[63, 2], [76, 6], [999, 64]],
-        "hyst": 5.0             # 降档回差(°C), 防止温度在档位边界来回抖
+        "hyst": 5.0,            # 降档回差(°C), 防止温度在档位边界来回抖
+        # ★降档最短驻留(秒, 2026-10-19 加): 只压"往低档退", 升档照旧立即生效;
+        #   温度掉到"目标段边界 - 10°C"以下时立即放行(待机该静音还是静音)。0 = 关。
+        "min_dwell_s": 60.0
     },
     # ---- 过热保护: 防止跑到固件的 _HOT 阈值被强制休眠 ----
     "guard": {
@@ -111,6 +114,11 @@ DEFAULT_CFG = {
         "flag_hot_c": 85.0,     # EC 温度到它就恢复"每次 EC 轮询都读固件标志"(平时 30 秒一次)
         "force_fan_max": True,  # 保护期间强制风扇满速
         "trip_flags": True,     # EC 0x89/0x8A/0x8B 一置位就是最高级(固件真判据)
+        # ★锁存出口(2026-10-19 加): 固件会把标志锁死不清零 —— 以前没有这条时,
+        #   PL1 被钉在 10W(倍频 10~17)自己造出锁频, 直到断电重启才恢复。
+        #   标志置位但 EC 持续 <= recover_c 满这么多秒 -> 判"固件锁存", 恢复功耗墙;
+        #   标志清零前不再据此降档(温度线 warn_c/crit_c 全程有效)。0 = 关掉这条出口。
+        "trip_hold_s": 180.0,
         "escape_hibernate": False
     },
     "comment": "pl1_w/pl2_w = 插电(高性能)档, pl1_w_batt/pl2_w_batt = 电池(平衡)档。mmio_mode: disable = MMIO清零+锁后只写MSR(免重启切档, 实测本机MSR可写时推荐); value = 写目标值进MMIO+锁(老方案, 改配置要重启)。poll_s/ec_poll_s/flag_poll_s = 主循环/EC读/固件标志读的间隔秒数(EC 是慢总线, 默认 15/30 秒)。fan = 风扇模式/温度曲线; guard = 过热保护阈值(本机 _TZ.THM0 _HOT=401K 会强制休眠, 所以要这条线)。"
@@ -924,7 +932,17 @@ def fan_cfg(cfg):
     return d
 
 
-_FAN = {'idx': None}
+_FAN = {'idx': None, 'lv': None, 't': 0.0}
+
+
+def _fan_ok(v):
+    """EC 回读的档位是否合法编码(0x00~0x07 / 0x40 满速 / 0x80 交还 EC)。
+
+    2026-10-19 实测日志里出现过 "风扇: 0x24 -> 满速" 这种行 —— 那是 EC 事务串位读到
+    别的寄存器的值。垃圾值不能当档位比较(否则每轮都重写、日志全是假变化), 但也不能
+    因此就不写目标档。见 fan_tick()。
+    """
+    return v is not None and (v <= 0x07 or v == FAN_MAX or v == FAN_AUTO)
 
 
 def fan_level_of(temp, curve, prev_idx=None, hyst=5.0):
@@ -947,7 +965,14 @@ def fan_level_of(temp, curve, prev_idx=None, hyst=5.0):
 
 
 def fan_tick(cfg, temp=None, force_max=False):
-    """按配置写一次风扇档位。返回变化描述; 没有变化返回 None。"""
+    """按配置写一次风扇档位。返回变化描述; 没有变化返回 None。
+
+    2026-10-19 加两处:
+      · 回读到的档位先校验 —— EC 与系统 ACPI 驱动共用 0x62/0x66, 串位会读到 0x2D/0x24
+        这类垃圾值。垃圾值不参与比较, 但目标档照写; 提示只记一行, 不再每轮刷假变化。
+      · 降档最短驻留 fan.min_dwell_s: 只压"往低档退", 升档照旧立即; 温度掉到
+        "目标段边界 - 10°C" 以下立即放行, 所以待机该安静还是安静。
+    """
     f = fan_cfg(cfg)
     mode = str(f.get('mode') or 'curve').lower()
     if temp is None:
@@ -965,16 +990,36 @@ def fan_tick(cfg, temp=None, force_max=False):
         if temp is None:
             return None
         want, idx = fan_level_of(temp, f['curve'], _FAN['idx'], float(f.get('hyst') or 5.0))
+        # ---- 降档最短驻留(只作用于"降温降档") ----
+        dwell = float(f.get('min_dwell_s') or 0.0)
+        prev_lv = _FAN.get('lv')
+        if (dwell > 0 and idx is not None and prev_lv is not None and want < prev_lv
+                and temp > f['curve'][idx][0] - 10.0
+                and (time.time() - (_FAN.get('t') or 0.0)) < dwell):
+            want, idx = prev_lv, _FAN.get('idx')
     cur = ec_hfsp()
     if cur is None:
         return None
+    if not _fan_ok(cur):
+        got = set_fan(want)                 # 回读不可信, 目标档照样写下去
+        _FAN['idx'] = idx
+        if got is None:
+            return '风扇: 写 0x%02X 失败(EC 无响应)' % want
+        return _note_once('fan_junk',
+                          '风扇: 档位回读异常(0x%02X, EC 事务串位) -> 已按目标重写 %s'
+                          % (cur, fan_name(got)))
     if cur == want:
         _FAN['idx'] = idx
+        _FAN['lv'] = cur
         return None
+    t0 = time.time()
     got = set_fan(want)
     _FAN['idx'] = idx
     if got is None:
         return '风扇: 写 0x%02X 失败(EC 无响应)' % want
+    if _FAN.get('lv') != got:
+        _FAN['t'] = t0                      # 档位真的变了 -> 驻留计时从这里起算
+    _FAN['lv'] = got
     why = ' (过热保护)' if force_max and mode != 'max' else (
         ' (%d°C)' % temp if (idx is not None and temp is not None) else '')
     return '风扇: %s -> %s%s' % (fan_name(cur), fan_name(got), why)
@@ -1007,9 +1052,11 @@ def set_pl_override(pl1, pl2=None):
     _PL_OVERRIDE = None if not pl1 else (float(pl1), float(pl2 or pl1))
 
 
-GUARD_MAX_JUMP = 15.0      # °C/轮: 3 秒内真实温度跳不了这么多, 超过就当可疑读数, 下轮确认
+GUARD_MAX_JUMP = 15.0      # °C/轮: 相邻两次真读跳这么多就当天可疑读数, 下一轮确认
+EC_JUMP_RETRY_S = 2.0      # ★可疑跳变时把下一轮 EC 读提前到这么多秒(见 temp_jump_pending)
 _G = {'level': None, 'since': 0.0, 'hibernate': False, 'last_et': None, 'trip_hits': 0,
-      'et_jump': False, 'last_flags': {}}
+      'et_jump': False, 'et_hold': False, 'last_flags': {},
+      'trip_since': None, 'trip_latched': False}
 
 
 def guard_cfg(cfg):
@@ -1053,6 +1100,38 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
         if hit and _G['trip_hits'] == 1:
             return ('注意: 固件过热标志读到 %s —— 再确认一轮(下一轮仍读到就动作)'
                     % ', '.join('0x%02X=0x%02X' % (h, v) for h, v in hit))
+
+    # ---- ★锁存出口(2026-10-19 加) ------------------------------------------------
+    # 实测: EC 0x89 的 bit0 会被固件"锁存"成 1, 温度回到 36~51°C 也不清零; 旧逻辑要
+    # "标志清零 + 温度正常"才解除 -> PL1 被钉在 10W(倍频 10~17), 工具自己造出锁频。
+    # 现在: 标志置位、且 EC 一直 <= recover_c 满 trip_hold_s 秒 -> 判"固件锁存",
+    # 恢复功耗墙并进入 latched 态; 标志清零前不再按标志降档, 但温度线(95/98)照旧。
+    hold = float(g.get('trip_hold_s') or 0.0)
+    desc = ', '.join('0x%02X=0x%02X' % (h, v) for h, v in hit)
+    if not hit:
+        _G['trip_since'] = None
+        if _G.get('trip_latched'):
+            _G['trip_latched'] = False
+            if _G['level'] == 'trip':
+                _G['level'] = None
+                set_pl_override(None)
+            return '固件过热标志已清零, 解除"锁存"判定(下次置位仍会正常保护)'
+    elif _G.get('trip_hits', 0) >= 2:
+        if _G.get('trip_since') is None:
+            _G['trip_since'] = time.time()
+        if (hold > 0 and et is not None and et <= g['recover_c']
+                and time.time() - _G['trip_since'] >= hold):
+            _G['trip_latched'] = True
+            _G['trip_since'] = time.time()
+            _G['level'] = None
+            set_pl_override(None)
+            return ('固件过热标志 %s 已挂 %.0f 秒, 而 EC 只有 %d°C(≤ %.0f°C) —— 判定为'
+                    '**固件把标志锁住了**, 不是真过热。已恢复正常功耗墙, 标志清零前不再'
+                    '据此降档(温度线 %g/%g 仍然有效)。彻底清掉它要断电重启。'
+                    % (desc, hold, et, g['recover_c'], g['warn_c'], g['crit_c']))
+        if _G.get('trip_latched'):
+            hit = []            # 锁存期间: 标志不再参与定级
+
     lv = None
     if hit and _G.get('trip_hits', 0) >= 2:
         lv = 'trip'
@@ -1152,11 +1231,14 @@ def tick(cfg=None, ec=True, read_flags=True):
             if prev is not None and abs(et - prev) > GUARD_MAX_JUMP:
                 if _G.get('et_jump'):
                     _G['et_jump'] = False    # 连续两轮都跳 -> 是真的在急升/急降, 认了
+                    _G['et_hold'] = False
                 else:
                     _G['et_jump'] = True
+                    _G['et_hold'] = True     # 本轮沿用了上一轮的值 -> 让调用方下轮快点再读
                     et = prev
             else:
                 _G['et_jump'] = False
+                _G['et_hold'] = False
             _G['last_et'] = et
     dts = None
     try:
@@ -1192,6 +1274,19 @@ def tick(cfg=None, ec=True, read_flags=True):
                 notes.append(n)
         except Exception as e:
             notes.append('风扇写入异常: %s' % e)
+    # ---- ★电池链路看门狗(2026-10-19 加) -----------------------------------------
+    # 那天 ACPI 电池数据全变成 0xFFFFFFFF(设计/满充 = -1 mWh), 工具全程无感, 是用户
+    # 自己发现"电池显示 -1"。GetSystemPowerStatus 不碰 EC、不花代价, 所以每轮都查。
+    b = battery_flags()
+    if b is not None:
+        ac_line, bflag, pct = b
+        if bflag in (128, 255) or pct == 255:
+            m = _note_once('battery_gone',
+                           '注意: 电池读数异常(ACPI BatteryFlag=%s, 电量=%s%%) —— 典型的 EC/电池'
+                           '链路失联(电池报告会显示 -1 mWh)。别拔适配器; 处置: 关机 -> 拔适配器'
+                           '-> 长按电源键 30 秒 -> 插回开机(手册 03 §9)。' % (bflag, pct))
+            if m:
+                notes.append(m)
     if _G['hibernate']:
         _G['hibernate'] = False
         do_hibernate()
@@ -1212,17 +1307,29 @@ def last_ec_temp():
     return _G.get('last_et')
 
 
+def temp_jump_pending():
+    """上一轮 EC 温度跳变太大、被当成可疑值沿用了吗? -> 调用方应把下一轮 EC 读提前。
+
+    2026-10-19: ec_poll_s=15 的下, 一次真升温就能超过 GUARD_MAX_JUMP(实测 8 线程 15 秒
+    涨 ~40°C), 光靠"沿用上一轮"会让风扇白等一整个 ec_poll_s 才升档 —— 现场因此摸到过
+    99°C。现在跳变被压住的下一轮按 EC_JUMP_RETRY_S(2 秒)再读一次, 连续两轮都跳就认。
+    """
+    return bool(_G.get('et_hold'))
+
+
 def flag_hot_c(cfg):
     """EC 温度到它就恢复"每次 EC 轮询都读固件标志"的阈值"""
     return float(guard_cfg(cfg).get('flag_hot_c') or 85.0)
 
 
-def poll_plan(cfg, fast=False, guard=False, hot=False):
+def poll_plan(cfg, fast=False, guard=False, hot=False, jump=False):
     """统一算三个轮询间隔(秒) -> (主循环, EC 读, 固件标志读)。
 
       fast  —— 开机/唤醒后前几分钟: 档位和风扇要尽快收敛, 三个都加密;
       guard —— 过热保护生效期间: 温度和标志都得盯紧, EC 读提到跟主循环同频;
-      hot   —— EC 温度高于 flag_hot_c: 标志改跟 EC 读同频(平时 30 秒一次)。
+      hot   —— EC 温度高于 flag_hot_c: 标志改跟 EC 读同频(平时 30 秒一次);
+      jump  —— ★上一轮 EC 温度跳变被当可疑值压住了(temp_jump_pending): EC 读提前到
+               EC_JUMP_RETRY_S, 赶紧再确认一次, 别让风扇白等一个 ec_poll_s。
     """
     d = DEFAULT_CFG
     poll = float(cfg.get('poll_s') or d['poll_s'])
@@ -1230,6 +1337,8 @@ def poll_plan(cfg, fast=False, guard=False, hot=False):
     fl = float(cfg.get('flag_poll_s') or d['flag_poll_s'])
     if fast:
         poll, ec, fl = min(poll, 2.0), min(ec, 5.0), min(fl, 10.0)
+    if jump:
+        ec, fl = min(ec, EC_JUMP_RETRY_S), min(fl, EC_JUMP_RETRY_S)
     if guard:
         ec, fl = min(ec, poll), min(fl, poll)
     elif hot:
@@ -1261,6 +1370,8 @@ def cmd_check():
     out('CPU 当前倍频      : %d  (约 %.2f GHz)' % (ratio, ratio / 10.0))
     out('MCHBAR            : %s' % (('0x%X' % mb) if mb else '读取失败'))
     out('当前电源          : %s' % ('AC 适配器' if on_ac() else '电池'))
+    print_battery_check(out)
+    print_version_check(out)
     if d_m:
         out('生效档位          : [%s] MSR PL1=%.2fW PL2=%.2fW (mmio_mode=%s)'
             % (_pick_profile(cfg)[2], d_m['pl1_w'], d_m['pl2_w'], mode))
@@ -1453,6 +1564,85 @@ def on_ac():
     except Exception:
         pass
     return True
+
+
+def print_version_check(out):
+    """部署漂移检查: 现在跑的 CpuPLFix.py 与工具仓库 %APPDATA%\\_repo 里那份是不是同一份。
+
+    2026-10-19 踩过: 跑着的代码不是磁盘上的代码(别的 agent 打了补丁又整体回滚),
+    排查时白绕了一大圈。以后 2-check 第一屏就有这一行。
+    """
+    import hashlib
+
+    def h(p):
+        try:
+            with open(p, 'rb') as f:
+                return hashlib.sha256(f.read()).hexdigest()[:12]
+        except Exception:
+            return None
+
+    me = os.path.abspath(__file__)
+    repo = os.path.join(os.path.dirname(os.path.dirname(me)), '_repo', 'CpuPLFix.py')
+    a, b = h(me), h(repo)
+    if b is None:
+        out('版本一致性       : %s (仓库 %s 不在, 不做对比)' % (a, repo))
+    elif a == b:
+        out('版本一致性       : [√] 与 _repo 一致 (%s)' % a)
+    else:
+        out('版本一致性       : [!] 与 _repo 不一致 (%s vs %s) —— 跑的这份不是仓库里那份'
+            % (a, b))
+
+
+def battery_flags():
+    """(ACLineStatus, BatteryFlag, BatteryLifePercent); BatteryFlag: 1=高 2=低 4=危急
+    8=充电中 128=没有系统电池 255=未知(读数无效)。取不到返回 None。
+
+    2026-10-19 那次 EC/电池链路失联时就是 255 —— 这就是"电池显示 -1"的机器侧判据。
+    """
+    try:
+        s = _SYSTEM_POWER_STATUS()
+        if k32.GetSystemPowerStatus(ctypes.byref(s)):
+            return s.ACLineStatus, s.BatteryFlag, s.BatteryLifePercent
+    except Exception:
+        pass
+    return None
+
+
+def battery_ec_state():
+    """从 EC 侧看电池: (0x38 HB0S/HB0A, 0xB0 起充, 0xB1 停充)。只读, 失败给 None。"""
+    return ec_read_ok(0x38), ec_read_ok(0xB0), ec_read_ok(0xB1)
+
+
+def print_battery_check(out):
+    """2-check 里那几行电池状态(Windows 侧 + EC 侧), 外加链路结论。"""
+    b = battery_flags()
+    if b:
+        ac_line, bflag, pct = b
+        out('电池(系统侧)     : %s  BatteryFlag=%s 电量=%s%%'
+            % ('AC 适配器' if ac_line == 1 else '电池供电', bflag,
+               '--' if pct == 255 else pct))
+    else:
+        out('电池(系统侧)     : 读不到(GetSystemPowerStatus 失败)')
+    hb0, bsc, bec = battery_ec_state()
+    if hb0 is None:
+        out('电池(EC 0x38)    : 读取失败')
+    else:
+        out('电池(EC 0x38)    : 0x%02X  HB0S=%d HB0A=%d%s'
+            % (hb0, hb0 & 0x7F, (hb0 >> 7) & 1,
+               '  [X] EC 认为**没有电池**(HB0S&7==7) —— 查电池排线/电池包' if (hb0 & 7) == 7 else ''))
+    if bsc is None or bec is None:
+        out('电池充电阈值     : 读取失败')
+    else:
+        bad = not (1 <= bsc <= 100 and 1 <= bec <= 100 and bec > bsc)
+        out('电池充电阈值     : 0xB0=0x%02X(%d%%) 起充 / 0xB1=0x%02X(%d%%) 停充%s'
+            % (bsc, bsc, bec, bec,
+               '  [X] 阈值不合法(要 1..100 且 停充>起充)' if bad
+               else ('  (0/0 = 不限制)' if (bsc == 0 and bec == 0) else '')))
+    if (b and (b[1] in (128, 255) or b[2] == 255)) or (hb0 is not None and (hb0 & 7) == 7):
+        out('  [X] 电池链路异常 —— 界面会显示 -1 / 没电池。处置: 关机 -> 拔适配器 -> '
+            '长按电源键 30 秒 -> 插回开机(EC 断电复位, 手册 03 §9)')
+    else:
+        out('  [√] 电池链路看起来正常')
 
 
 MMIO_DISABLED_LOCKED = 1 << 63     # MMIO 清零 + 锁: 禁用固件侧, MSR 全权控制
@@ -1971,6 +2161,26 @@ def cmd_uninstall():
     return 0
 
 
+def svc_guard_active(cfg, et=None, flags=None):
+    """看守服务是否正在"压着保护档"? -> cmd_boot 用它决定让位。
+
+    2026-10-19 实测: 计划任务 boot 与服务同时看守时, 两边各有自己的保护状态(在进程内存里,
+    互相看不见), 把 PL1 在 40W↔10W 之间互改了 4 分钟 41 次。规则:
+      · 服务没在跑 -> 永不让位(必须自己修: 固件每次唤醒都会压低功耗墙);
+      · 服务在跑 + EC 温度 > recover_c 或固件标志置位(=服务正压着保护档)-> 让位;
+      · 其余情况照常检查/修复(这是刚需, 不能因为"服务在跑"就整个让掉)。
+    """
+    try:
+        exists, running = svc_state(SVC_TOOL)
+    except Exception:
+        return False
+    if not (exists and running):
+        return False
+    if et is not None and et > guard_cfg(cfg)['recover_c']:
+        return True
+    return bool(ec_tripped(flags or {}))
+
+
 def cmd_boot():
     """开机 / 唤醒后尽早执行。已经健康就直接退出, 不健康才修复并进看守。"""
     t_start = time.time()
@@ -2020,8 +2230,11 @@ def cmd_boot():
         out('[*] 预检异常: %s' % e)
 
     if healthy:
-        for n in tick(cfg):             # 功耗墙已健康, 但风扇还得按曲线走
-            out('[*] %s' % n)
+        if svc_guard_active(cfg, last_ec_temp(), _G.get('last_flags')):
+            out('[*] 看守服务正在压过热保护档 —— 本任务让位(只记录, 不碰功耗墙)')
+        else:
+            for n in tick(cfg):         # 功耗墙已健康, 但风扇还得按曲线走
+                out('[*] %s' % n)
         if quiet:
             out('[*] 定时复查: 状态正常, 无需修复 (已运行 %.0f 秒, 倍频 %d)'
                 % (uptime(), (rdmsr(MSR_PERF_STATUS) or 0) >> 8 & 0xFF))
@@ -2054,13 +2267,21 @@ def cmd_boot():
             guard = guard_level() is not None
             t = last_ec_temp()
             hot = t is not None and t >= flag_hot_c(cfg)
-            _poll_i, ec_i, fl_i = poll_plan(cfg, fast=True, guard=guard, hot=hot)
+            _poll_i, ec_i, fl_i = poll_plan(cfg, fast=True, guard=guard, hot=hot,
+                                            jump=temp_jump_pending())
             do_ec = (now - last_ec) >= ec_i
             do_fl = do_ec and (now - last_fl) >= fl_i
             if do_ec:
                 last_ec = now
             if do_fl:
                 last_fl = now
+            if svc_guard_active(cfg, last_ec_temp(), _G.get('last_flags')):
+                m = _note_once('boot_yield', '[*] 看守服务正在压过热保护档 —— 本任务让位'
+                                             '(免得两边互改 MSR, 2026-10-19 实测 41 次/4 分钟)')
+                if m:
+                    out(m)
+                    flush_log('boot')
+                continue
             notes = tick(cfg, ec=do_ec, read_flags=do_fl)
             if notes:
                 fixed_times += 1
