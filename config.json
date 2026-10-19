@@ -39,7 +39,8 @@
     "load_boost_level": 64,
     "load_hold_s": 30.0,
     "min_write_gap_s": 10.0,
-    "dts_max_c": 92.0
+    "dts_max_c": 92.0,
+    "enabled": false
   },
   "guard": {
     "enabled": true,

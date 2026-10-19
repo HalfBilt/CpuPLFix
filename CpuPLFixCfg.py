@@ -6,6 +6,7 @@
     CpuPLFixCfg.py fan=56,79,5 改风扇曲线边界 + 回差
     CpuPLFixCfg.py hold=45 改固件标志锁存判定秒数（0=关掉这条出口）
     CpuPLFixCfg.py tpower=on/off 温度→功耗调节器（风扇优先：日常功耗跟着温度走；默认 off）
+    CpuPLFixCfg.py fanoff      关闭风扇控制（完全不碰风扇，交还 EC 原生曲线；fanon 打开）
     CpuPLFixCfg.py dwell=60 降温降档最短驻留秒数（0=关）
     CpuPLFixCfg.py flag_pl=20,28 标志置位但温度正常时的 PL1,PL2（默认=预警档，不砍到 10W）
     CpuPLFixCfg.py gmin=30 保护最短驻留秒数 / rel=10 解除驻留秒数
@@ -122,6 +123,8 @@ def show(cfg):
     print('  mode=%s        curve / max / level / ec' % cfg['fan']['mode'])
     print('  level=%s           mode=level 时用' % cfg['fan']['level'])
     print('  hyst=%g            降档回差（C）' % cfg['fan']['hyst'])
+    print('  fanon/fanoff=%s   风扇总开关：off = 完全不碰风扇，全交给 EC 原生曲线'
+          % onoff(f.get('enabled', True)))
     print('  dwell=%g           降温降档最短驻留（秒，0=关）'
           % cfg['fan'].get('min_dwell_s', 60.0))
     print('  boost=%g,%g,%g      负载前馈：占用>=x%% 满 y 秒 -> 至少 z 档（64=满速；x=0 关）'
@@ -251,6 +254,10 @@ def apply_kv(cfg, key, val):
         cfg['poll_s'] = _num(a, 1, 600, '主循环间隔')
         cfg['ec_poll_s'] = _num(b, 2, 600, 'EC 读间隔')
         cfg['flag_poll_s'] = _num(c, 2, 600, '固件标志间隔')
+    elif k in ('fanon', 'fanoff'):
+        # ★2026-10-20: 风扇总开关。off = 完全不碰风扇(不读 0x2F/转速、不写档位),
+        #   全交给 EC 原生曲线; 手动 `fan` 命令仍可用。保护只剩功耗墙。
+        f['enabled'] = (k == 'fanon')
     elif k == 'fan':
         xs = [s.strip() for s in str(val).split(',')]
         n = len(f['curve']) - 1

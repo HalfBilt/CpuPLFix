@@ -90,6 +90,11 @@ DEFAULT_CFG = {
     "flag_poll_slow_s": 120.0,
     # ---- 风扇(可选, 本机实测有效; 其他机型没有 EC 寄存器 0x2F 就自动跳过) ----
     "fan": {
+        # ★2026-10-20: 风扇总开关。false = **完全不碰风扇** —— 不读 0x2F、不读转速
+        #   (0x84/0x85)、不写任何档位, 全交给 EC 固件自己的曲线; 手动 `fan` 命令仍可用。
+        #   用途: ① 想用原生曲线 ② 减少 EC 访问(风扇写入是主要写入源)。
+        #   注意: 关掉后 `guard.force_fan_max` 也就不生效了(保护只靠功耗墙)。
+        "enabled": True,
         "mode": "curve",        # curve = 按温度曲线自动 / max = 满速 / off = 交还 EC 自动 / level = 固定档
         "level": 0,             # mode=level 时用: 1~7 是 EC 固定档, 64 是满速
         # ★2026-10-20: 加 7 档当中间档(实测 4388 恒定, 比 0x40 无负载时的 4160 还快)。
@@ -2068,7 +2073,8 @@ def tick(cfg=None, ec=True, read_flags=True):
     load = cpu_load_pct()          # 每轮都采(不碰 EC/不开句柄), 给风扇前馈用
     # 负载前馈的计时放在这里(5 秒粒度; 放在 fan_tick 里只有 EC 的 15 秒粒度, 两次压测实测太慢)
     _fc = fan_cfg(cfg)
-    _lbp = float(_fc.get('load_boost_pct') or 0.0)
+    _fan_on = bool(_fc.get('enabled', True))
+    _lbp = float(_fc.get('load_boost_pct') or 0.0) if _fan_on else 0.0
     boost = False
     if _lbp > 0 and load is not None:
         if load >= _lbp:
@@ -2111,13 +2117,16 @@ def tick(cfg=None, ec=True, read_flags=True):
         tail = cool_tail_active(cfg)
         force = bool(g.get('force_fan_max', True)) and (
             _G['level'] in ('warn', 'crit', 'trip', 'escape', 'flag') or tail)
-        try:
-            n = fan_tick(cfg, et, force_max=force, load=load, dts=dts, boost=boost,
-                         force_why='过热保护尾部' if tail and _G['level'] is None else None)
-            if n:
-                notes.append(n)
-        except Exception as e:
-            notes.append('风扇写入异常: %s' % e)
+        if _fan_on:
+            try:
+                n = fan_tick(cfg, et, force_max=force, load=load, dts=dts, boost=boost,
+                             force_why='过热保护尾部' if tail and _G['level'] is None else None)
+                if n:
+                    notes.append(n)
+            except Exception as e:
+                notes.append('风扇写入异常: %s' % e)
+        # ★2026-10-20: fan.enabled=false 时**整块跳过** —— 连 ec_hfsp()/ec_rpm() 都不调,
+        #   这样自动轮询里对 EC 的写操作归零、读操作只剩温度(和标志)。
         rep = ec_bus_report()
         if rep:
             notes.append(rep)
@@ -2399,7 +2408,12 @@ def cmd_check():
         _n, _b, _ms, _re = ec_bus_stats()
         out('%s 本进程事务 %d 次 / 撞车 %d 次 / 读失败 %d 次, 当前自适应等待 %.1f ms'
             % (_pad('EC 总线', 26), _n, _b, _re, _ms))
-        out('%s %s' % (_pad('风扇模式', 26), '%s   (config.json -> fan.mode)' % f.get('mode')))
+        if not f.get('enabled', True):
+            out('%s %s' % (_pad('风扇模式', 26),
+                           '已关闭(fan.enabled=false) —— 完全交还 EC 原生曲线, 自动轮询不读不写'))
+        else:
+            out('%s %s' % (_pad('风扇模式', 26),
+                           '%s   (config.json -> fan.mode)' % f.get('mode')))
         if str(f.get('mode')).lower() == 'curve':
             out('%s %s' % (_pad('温度曲线', 26),
                            ' '.join('≤%d°C->%s' % (hi, '满速' if lv >= FAN_MAX else '%d档' % lv)
@@ -3313,7 +3327,10 @@ def cmd_fan(args):
         out('固件过热标志  : %s' % (flags_desc(fl) +
                                    ('   [!] 已置位(固件正在报 _HOT)' if ec_tripped(fl) else '   (正常)')
                                    if fl else '读取失败'))
-        out('风扇模式      : %s   (config.json -> fan.mode)' % f.get('mode'))
+        if not f.get('enabled', True):
+            out('风扇模式      : 已关闭(fan.enabled=false) —— 完全交还 EC 原生曲线')
+        else:
+            out('风扇模式      : %s   (config.json -> fan.mode)' % f.get('mode'))
         out('过热保护      : %s' % ('已开启 (预警 %.0f°C/严重 %.0f°C/逃生 %.0f°C)'
                                    % (g['warn_c'], g['crit_c'], g['escape_c'])
                                    if g.get('enabled') else '已关闭'))
