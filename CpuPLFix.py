@@ -3271,6 +3271,44 @@ def cmd_fan(args):
     return 2
 
 
+def cmd_lock():
+    """看两把命名互斥体能不能被**普通用户**打开(DACL 有没有放开)。**不需要管理员**。
+
+    2026-10-19: 原来"跨进程互斥"这条保险在本机其实是失效的 —— 命名互斥体默认继承
+    **创建者**的默认 DACL, 而看守服务以 SYSTEM 身份创建 -> 用户级进程 OpenMutex 一律
+    ERROR_ACCESS_DENIED(实测四种权限组合全是 err=5), 于是 2-check / fan 命令 /
+    13-EC诊断 / 15-EC延时对照 这些用户级工具一把锁都没拿到, 等于完全不加锁地和
+    看守服务抢同一对端口。现在改成显式给 "Everyone: SYNCHRONIZE|MUTEX_MODIFY_STATE"
+    的 DACL, 这个命令就是用来验它的。
+    """
+    out('EC 互斥体可及性（不需要管理员）:')
+    ok_all = True
+    for slot, name in (('_probe_own', EC_MUTEX_NAME), ('_probe_peer', EC_MUTEX_PEER)):
+        h = _mx_handle(slot, name)
+        if not h:
+            out('  %-22s  打开失败' % name)
+            ok_all = False
+            continue
+        try:
+            r = k32.WaitForSingleObject(h, 0)
+        except Exception:
+            r = -1
+        if r == 0:
+            try:
+                k32.ReleaseMutex(h)
+            except Exception:
+                pass
+        state = {0: '空闲(能立刻拿到锁)',
+                 0x80: '上次持有者异常退出(已废弃)',
+                 0x102: '正被别人持有(服务在跑时正常)'}.get(r, '未知(%s)' % r)
+        out('  %-22s  可打开; %s' % (name, state))
+    out('')
+    out('  "可打开" = 普通用户也拿得到这两把锁 -> 跨进程互斥、以及和 HWiNFO 那类'
+        '用户级工具的"同行锁"才真正生效。')
+    out('  打不开 = DACL 又被收窄了（服务是 SYSTEM 身份创建的, 会继承 SYSTEM 的 DACL）。')
+    return 0 if ok_all else 1
+
+
 def main():
     try:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -3284,8 +3322,9 @@ def main():
     cmd = sys.argv[1].lower() if len(sys.argv) > 1 else 'check'
     if cmd in ('-h', '--help', 'help', '?'):
         print(__doc__)
-        print('用法: CpuPLFix.py [check|fix|save|install|uninstall|watch|boot|fan]')
+        print('用法: CpuPLFix.py [check|fix|save|install|uninstall|watch|boot|fan|lock]')
         print('  风扇: CpuPLFix.py fan [状态|curve|max|auto|level N]')
+        print('  互斥: CpuPLFix.py lock  (不需要管理员; 看两把 EC 锁普通用户能不能打开)')
         return 0
 
     if cmd == 'fan':
@@ -3300,7 +3339,8 @@ def main():
         return rc or 0
 
     fn = {'check': cmd_check, 'fix': cmd_fix, 'save': cmd_save, 'boot': cmd_boot,
-          'install': cmd_install, 'uninstall': cmd_uninstall, 'watch': cmd_watch}.get(cmd)
+          'install': cmd_install, 'uninstall': cmd_uninstall, 'watch': cmd_watch,
+          'lock': cmd_lock}.get(cmd)
     if not fn:
         print('未知命令: %s' % cmd)
         return 2

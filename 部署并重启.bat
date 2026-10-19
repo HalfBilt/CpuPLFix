@@ -69,8 +69,10 @@ echo   - 2-check prints the fan level label with 3880 RPM (not the old 3490)
 echo   - fan write problems now say either "write failed" or "readback not confirmed"
 echo   - the health line now reads "EC bus: ... N transactions ... collisions ..."
 echo     (new wording; it counts transactions, not read decisions)
-echo   - a NON-admin "2-check" can now OPEN the two named mutexes (DACL fixed:
-echo     service used to create them as SYSTEM, so user-level tools got err=5)
+echo   - a NON-admin process can now OPEN the two named mutexes. Check it with:
+echo       %APPDATA%\CpuPLFix\runtime\python.exe %APPDATA%\_repo\CpuPLFix.py lock
+echo     (it must print "can open" for both; NOTE: 2-check itself always needs admin,
+echo      because it opens the TSCtl driver - that is unrelated to the mutex)
 echo   - a new "===== ... svc =====" block appears in fix.log after the restart
 echo.
 pause
