@@ -39,6 +39,7 @@ import os
 import struct
 import subprocess
 import sys
+import threading
 import time
 import datetime
 from ctypes import wintypes as w
@@ -3333,6 +3334,141 @@ def cmd_lock():
     return 0 if ok_all else 1
 
 
+def _pl_time(v, shift):
+    """MSR 0x610 里的时间窗字段: bits 16:17=Y, 22:23=Z -> 秒 = 2^Y * (1 + Z/4)。"""
+    y = (v >> shift) & 3
+    z = (v >> (shift + 6)) & 3
+    return (1 << y) * (1.0 + z / 4.0)
+
+
+def _rapl_pl(v):
+    """MSR 0x638/0x639/0x64A: bits 15:0 = 瓦(1/8), 16:17/22:23 = 时间窗。"""
+    if v is None:
+        return None, None
+    return (v & 0x7FFF) / 8.0, _pl_time(v, 16)
+
+
+def cmd_power():
+    """打印这颗 CPU 的功耗信息: 芯片自己声明的约束 / 当前生效的功耗墙 / 实测封装功率。
+
+    2026-10-19 加: 用户问"这 CPU 日常功耗应该设多少"。光看 config 里的 28W 是不够 ——
+    要看**硬件自己**声明的约束，那才是这颗芯片的标称功耗:
+      MSR 0x638 PP0_RAPL_PL1_HW  硬件强制的 PL1 (= 芯片的 PBP)
+      MSR 0x639 PP0_RAPL_PL2_HW  硬件强制的 PL2 (= 芯片的 MTP)
+      MSR 0x64A PP0_RAPL_PL4_HW  硬件强制的 PL4 (瞬时峰值)
+      MSR 0x614 PKG_POWER_INFO   标称 TDP
+      MSR 0x615 PKG_THERMAL_MAX  硬件过热上限
+      MSR 0x610/0x612            当前**生效**的功耗墙和时间窗(工具写进去的)
+      MSR 0x611 + 0x606          封装能耗计数器 -> 实测功率
+
+    对照:
+      i7-1360P (4P+8E, 18MB L3)  PBP 28W / MTP 64W / TjMax 100°C
+      i7-1365U (2P+8E+2LPE,18MB) PBP 15W / MTP 55W / TjMax 100°C
+      —— 两者都是 12核16线程 + 18MB L3，光看 WMI 分不出来，得看上面那两个 MSR。
+    """
+    out('=== CPU 功耗信息  %s ===' % time.strftime('%Y-%m-%d %H:%M:%S'))
+    out()
+    out('--- 芯片自己声明的约束（硬件强制，改不了）---')
+    pl1_hw, t1_hw = _rapl_pl(rdmsr(0x638))
+    pl2_hw, t2_hw = _rapl_pl(rdmsr(0x639))
+    pl4_hw, t4_hw = _rapl_pl(rdmsr(0x64A))
+    out('  PL1 硬件上限 (0x638) : %s' % ('%.0f W (窗 %s 秒)' % (pl1_hw, t1_hw) if pl1_hw else '读不到'))
+    out('  PL2 硬件上限 (0x639) : %s' % ('%.0f W (窗 %s 秒)' % (pl2_hw, t2_hw) if pl2_hw else '读不到'))
+    out('  PL4 硬件上限 (0x64A) : %s' % ('%.0f W (窗 %s 秒)' % (pl4_hw, t4_hw) if pl4_hw else '读不到'))
+    tdp = rated_tdp()
+    out('  标称 TDP     (0x614) : %s' % ('%.0f W' % tdp if tdp else '读不到'))
+    tmax = rdmsr(0x615)
+    out('  过热上限     (0x615) : %s' % ('%.0f W' % ((tmax & 0x7FFF) / 8.0) if tmax else '读不到'))
+    if pl1_hw and pl2_hw:
+        if abs(pl1_hw - 28) <= 2 and abs(pl2_hw - 64) <= 3:
+            out('  → 与 **i7-1360P** 一致（PBP 28W / MTP 64W）')
+        elif abs(pl1_hw - 15) <= 2 and abs(pl2_hw - 55) <= 3:
+            out('  → 与 **i7-1365U** 一致（PBP 15W / MTP 55W）')
+        else:
+            out('  → 两款零售 SKU 都不完全对上（工程样本/另有 SKU），按实测值定功耗墙')
+    out()
+    out('--- 当前生效的功耗墙（工具写进 MSR 的）---')
+    v = rdmsr(0x610)
+    if v:
+        d = decode_pl(v)
+        out('  MSR 0x610: PL1=%.0fW (窗 %.1f 秒)  PL2=%.0fW (窗 %.1f 秒)  锁定位=%d'
+            % (d['pl1_w'], _pl_time(v, 16), d['pl2_w'], _pl_time(v, 48), d['lock']))
+    else:
+        out('  MSR 0x610: 读不到')
+    vt = rdmsr(0x612)
+    if vt:
+        out('  MSR 0x612: PL1 窗 %.1f 秒 / PL2 窗 %.1f 秒' % (_pl_time(vt, 16), _pl_time(vt, 48)))
+    cfg = load_cfg()
+    out('  config.json: pl1_w=%.0f pl2_w=%.0f (电池 %.0f/%.0f) pl1_time=%s pl2_time=%s'
+        % (float(cfg.get('pl1_w') or 0), float(cfg.get('pl2_w') or 0),
+           float(cfg.get('pl1_w_batt') or 0), float(cfg.get('pl2_w_batt') or 0),
+           cfg.get('pl1_time'), cfg.get('pl2_time')))
+    out()
+    out('--- 实测封装功率（MSR 0x611 能量计数器）---')
+    unit = rdmsr(0x606)
+    e_unit = (1.0 / (1 << 16)) if unit else (1.0 / 65536.0)
+    e0 = rdmsr(0x611)
+    if e0 is None:
+        out('  读不到能量计数器')
+        return 1
+    e0 &= 0xFFFFFFFF
+    t0 = time.time()
+    time.sleep(2.0)
+    e1 = (rdmsr(0x611) or 0) & 0xFFFFFFFF
+    dt = max(0.001, time.time() - t0)
+    p_idle = ((e1 - e0) & 0xFFFFFFFF) / e_unit / dt
+    out('  空闲封装功率: %.1f W' % p_idle)
+    th = cpf_read_thermal()
+    if th:
+        out('  当前核心温度(DTS 公式): %d°C (TjMax %d°C, 节流标志=%d)'
+            % (th['temp'], th['tjmax'], th['thermal_status']))
+    # ---- 短负载: 看功耗墙到底有没有生效 ----
+    ncpu = os.cpu_count() or 8
+    n = min(8, ncpu)
+    out()
+    out('  正在跑 %d 线程满载 15 秒，看实际功率 ...' % n)
+    stop = threading.Event()
+    ths = []
+
+    def spin():
+        x = 0.0
+        while not stop.is_set():
+            for _ in range(20000):
+                x = x * 1.000001 + 1.0
+
+    for _ in range(n):
+        t = threading.Thread(target=spin, daemon=True)
+        t.start()
+        ths.append(t)
+    samples = []
+    e_prev = (rdmsr(0x611) or 0) & 0xFFFFFFFF
+    t_prev = time.time()
+    t_start = time.time()
+    while time.time() - t_start < 15.0:
+        time.sleep(0.5)
+        e_now = (rdmsr(0x611) or 0) & 0xFFFFFFFF
+        now = time.time()
+        d = max(0.01, now - t_prev)
+        samples.append(((e_now - e_prev) & 0xFFFFFFFF) / e_unit / d)
+        e_prev, t_prev = e_now, now
+    stop.set()
+    for t in ths:
+        t.join(timeout=1.0)
+    e_end = (rdmsr(0x611) or 0) & 0xFFFFFFFF
+    dt = max(0.01, time.time() - t_prev)
+    samples.append(((e_end - e_prev) & 0xFFFFFFFF) / e_unit / dt)
+    if samples:
+        out('  满载封装功率: 平均 %.1f W / 峰值 %.1f W / 末值 %.1f W'
+            % (sum(samples) / len(samples), max(samples), samples[-1]))
+    th = cpf_read_thermal()
+    if th:
+        out('  满载后核心温度: %d°C (节流标志=%d)' % (th['temp'], th['thermal_status']))
+    out()
+    out('  怎么看: 若"满载平均"明显超过 PL1，说明功耗墙没压住（PL2 突发的 6 秒窗口也算进去）；')
+    out('        若峰值≈PL2 而平均≈PL1，说明功耗墙工作正常。')
+    return 0
+
+
 def main():
     try:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -3346,9 +3482,10 @@ def main():
     cmd = sys.argv[1].lower() if len(sys.argv) > 1 else 'check'
     if cmd in ('-h', '--help', 'help', '?'):
         print(__doc__)
-        print('用法: CpuPLFix.py [check|fix|save|install|uninstall|watch|boot|fan|lock]')
+        print('用法: CpuPLFix.py [check|fix|save|install|uninstall|watch|boot|fan|lock|power]')
         print('  风扇: CpuPLFix.py fan [状态|curve|max|auto|level N]')
         print('  互斥: CpuPLFix.py lock  (不需要管理员; 看两把 EC 锁普通用户能不能打开)')
+        print('  功耗: CpuPLFix.py power  (要管理员; 芯片功耗约束 + 生效的功耗墙 + 实测功率)')
         return 0
 
     if cmd == 'fan':
@@ -3364,7 +3501,7 @@ def main():
 
     fn = {'check': cmd_check, 'fix': cmd_fix, 'save': cmd_save, 'boot': cmd_boot,
           'install': cmd_install, 'uninstall': cmd_uninstall, 'watch': cmd_watch,
-          'lock': cmd_lock}.get(cmd)
+          'lock': cmd_lock, 'power': cmd_power}.get(cmd)
     if not fn:
         print('未知命令: %s' % cmd)
         return 2
