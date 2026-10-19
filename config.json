@@ -1,8 +1,8 @@
 {
-  "pl1_w": 0,
-  "pl2_w": 0,
-  "pl1_w_batt": 0,
-  "pl2_w_batt": 0,
+  "pl1_w": 28.0,
+  "pl2_w": 55.0,
+  "pl1_w_batt": 20.0,
+  "pl2_w_batt": 28.0,
   "pl1_time": 35,
   "pl2_time": 66,
   "min_pl1_w": 15.0,
@@ -16,11 +16,11 @@
     "level": 0,
     "curve": [
       [
-        63,
+        56,
         2
       ],
       [
-        76,
+        79,
         6
       ],
       [
@@ -29,7 +29,13 @@
       ]
     ],
     "hyst": 5.0,
-    "min_dwell_s": 60.0
+    "min_dwell_s": 60.0,
+    "load_boost_pct": 70.0,
+    "load_boost_s": 10.0,
+    "load_boost_level": 64,
+    "load_hold_s": 30.0,
+    "min_write_gap_s": 10.0,
+    "dts_max_c": 92.0
   },
   "guard": {
     "enabled": true,
@@ -37,16 +43,40 @@
     "crit_c": 98.0,
     "escape_c": 105.0,
     "recover_c": 78.0,
-    "warn_pl1_w": 20.0,
-    "warn_pl2_w": 28.0,
-    "crit_pl1_w": 10.0,
-    "crit_pl2_w": 14.0,
+    "warn_pl1_w": 0.0,
+    "warn_pl2_w": 40.0,
+    "crit_pl1_w": 28.0,
+    "crit_pl2_w": 35.0,
     "dts_crit_c": 97.0,
     "flag_hot_c": 85.0,
     "force_fan_max": true,
     "trip_flags": true,
     "escape_hibernate": false,
-    "trip_hold_s": 180.0
+    "trip_hold_s": 45.0,
+    "flag_pl1_w": 20.0,
+    "flag_pl2_w": 28.0,
+    "min_hold_s": 30.0,
+    "release_dwell_s": 10.0,
+    "cool_tail_s": 30.0,
+    "crit2_pl1_w": 20.0,
+    "crit2_pl2_w": 25.0,
+    "crit3_pl1_w": 12.0,
+    "crit3_pl2_w": 14.0,
+    "crit_hold_s": 10.0,
+    "crit_now_c": 100.0,
+    "step_dwell_s": 15.0,
+    "ramp_step_s": 30.0,
+    "ramp_pls": [
+      [
+        20.0,
+        25.0
+      ],
+      [
+        28.0,
+        35.0
+      ]
+    ]
   },
-  "comment": "默认 0 = 自动: 把 MSR 里原厂的功耗墙镜像过去, 一个瓦都不改(推荐先这么用)。想压温度就填具体瓦数, 例如 pl1_w=30, pl2_w=40; 电池档填 pl1_w_batt/pl2_w_batt。mmio_mode: disable = MMIO 清零+锁后只写 MSR(免重启切档); value = 写目标值进 MMIO+锁(老方案, 改配置要重启)。poll_s/ec_poll_s/flag_poll_s = 主循环/EC读/固件标志读的间隔秒数(EC 是慢总线, 默认 5/15/30 秒; 开机前 5 分钟、过热保护期间、EC 温度超过 guard.flag_hot_c 时自动加密)。fan = 风扇模式/温度曲线(本机 EC 寄存器 0x2F, 曲线格式 [[温度上限,档位],...]); guard = 过热保护(0x78 温度线 + EC 0x89/0x8A/0x8B 固件标志线)。详见 说明.txt。"
+  "comment": "本机实用配置。插电(AC): PL1=28W(=i7-1360P 的 PBP) PL2=55W(突发, 时间窗 6 秒); 电池: PL1=20W(Minimum Assured Power) PL2=28W。PPC: 温度墙按\"驻留+三级阶梯\"(2026-10-19 改): 预警 95°C 只收 PL2 到 40W(PL1 不动); 严重 98°C 持续 10 秒(或单次到 100°C=TjMax) -> 28/35W -> 每 15 秒还压不下来就 20/25W -> 12/14W; 解除(EC<=78°C 稳住 10 秒)后按 20/25 -> 28/35 -> 原档每级 30 秒回升。mmio_mode=disable: 开机把固件侧 MMIO 清零+锁, 之后只写 MSR, 改配置/拔插电免重启。poll_s/ec_poll_s/flag_poll_s=主循环/EC读/固件标志读秒数(默认 5/15/30; 凉机标志读降到 flag_poll_slow_s=120 秒, 少打扰 EC)。fan.min_dwell_s=降温降档最短驻留; fan.min_write_gap_s=非紧急写入最小间隔(只压降档); fan.dts_max_c=DTS 前馈立刻拉满。",
+  "flag_poll_slow_s": 120.0
 }
