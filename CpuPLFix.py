@@ -1369,6 +1369,13 @@ def fan_tick(cfg, temp=None, force_max=False, load=None, force_why=None,
     if got is None:
         return _note_once('fan_rb_%02x' % want,
                           '风扇: 已写 0x%02X, 但回读没确认(EC 事务串位) —— 下一轮会重试' % want)
+    if not _fan_ok(got):
+        # ★2026-10-19: 回读值不是合法档位编码时不能当"已达成" —— 日志里出现过
+        #   "风扇: 6 档(约 3490 RPM) -> 0x30 (84°C)"(0x30=48 不是档位), 那是串位读到的
+        #   别的寄存器。以前这里直接写进日志、还覆盖了 _FAN['lv'] 和驻留计时。
+        return _note_once('fan_rb_bad_%02x' % got,
+                          '风扇: 已写 %s, 但回读值 0x%02X 不在合法档位里(EC 事务串位) —— 下一轮再看'
+                          % (fan_name(want), got))
     if _FAN.get('lv') != got:
         _FAN['t'] = t0                      # 档位真的变了 -> 驻留计时从这里起算
     _FAN['lv'] = got
