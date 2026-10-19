@@ -157,9 +157,11 @@ DEFAULT_CFG = {
         # ★2026-10-19(用户指出后加): 标志档的"温度正常持续一段时间就自动解除"出口。
         #   标志挂着 + 温度连续 <= flag_release_c 达 flag_release_s 秒 -> 判"固件锁存位,
         #   不是真过热" -> 分级回升放开, 并保持放开(标志清零前不再据此降档)。
-        #   默认 flag_release_c = 预警线(95°C): 低于预警线就算"温度正常"。
+        #   ★2026-10-20: flag_release_c 由"预警线 95°C"提到 **97°C**。理由: 本机 28W 满载
+        #   稳态就是 89~95°C, 偶尔触到 96 —— 线画在 95 会让"连续"计时被反复重置, 退回
+        #   "永远压着 20/28W"的老毛病。97 低于 crit_c(98), 真过热仍由温度线接管。
         #   flag_release_s = 0 表示关掉这条出口(退回"标志不清零就一直压着"的老行为)。
-        "flag_release_c": 95.0,
+        "flag_release_c": 97.0,
         "flag_release_s": 60.0,
         "min_hold_s": 30.0,
         "release_dwell_s": 10.0,
@@ -1711,11 +1713,13 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
         # 旧条件要求"EC <= recover_c(78°C) 满 45 秒"才算锁存, 而 78°C 在本机偏苛刻:
         # 28W 满载的稳态就是 89~95°C —— 于是标志一挂上, 只要温度在 78~95°C 之间就被
         # **永久**压在 20/28W(不再自动放开)。现在改成:
-        #   连续 (ET <= flag_release_c, 默认 = 预警线 95°C) 达 flag_release_s(默认 60 秒)
+        #   连续 (ET <= flag_release_c, 默认 97°C) 达 flag_release_s(默认 60 秒)
         #   -> 判"固件锁存位, 不是真过热" -> 分级回升放开并保持(sticky)。
         # 关键是"连续": 中途温度升过线, 计时从头来 —— 所以不会 60 秒来回切。
+        # ★2026-10-20: 线从 95 提到 97。95 太贴满载稳态(89~95, 偶尔 96), "连续"会被
+        #   反复打断, 又退回"永远压着"; 97 仍低于 crit_c(98), 真过热由温度线接管。
         _rc = g.get('flag_release_c')
-        rel_c = float(g['warn_c'] if _rc is None else _rc)
+        rel_c = 97.0 if _rc is None else float(_rc)
         _rs = g.get('flag_release_s')
         if _rs is None:
             _rs = g.get('trip_hold_s')            # 兼容旧配置: 旧键语义 = 锁存判定秒数

@@ -1,129 +1,282 @@
 # -*- coding: utf-8 -*-
-"""离线自检: 不碰硬件, 只验证 guard_apply 的分级/解除 与 fan_level_of 的回差。
+"""离线自检: 不碰硬件。
 
-跑法(工具自带的 python 就行):
+覆盖:
+  1) guard_apply 的温度线三级阶梯 / 驻留 / 解除 / 分级回升
+  2) 固件标志线: 两轮确认 / 读失败不放开 / 97°C 连续 60 秒判锁存 / 98°C 重置
+  3) fan_level_of 的三段曲线与 5°C 回差
+  4) poll_plan 的节奏(凉机 120 秒 / 保护期 5-5-15 / 开机 2-5-10)
+  5) MSR 0x610 时间窗解码: _tau_s 与 _pl_time 必须一致(SDM: 8 秒 / 5 秒)
+  6) merge_flags: 读失败沿用上一轮、complete=False
+  7) 3-config 的 hold= 同时写 trip_hold_s 与 flag_release_s
+
+跑法:
     "%APPDATA%\\CpuPLFix\\runtime\\python.exe" dev\\selftest.py
-默认测【已安装】的那份代码(%APPDATA%\\CpuPLFix\\CpuPLFix.py); 想测仓库里这份, 把
-DEP 改成 os.path.dirname(os.path.dirname(os.path.abspath(__file__))) 即可。
+默认测【已安装】那份(%APPDATA%\\CpuPLFix\\CpuPLFix.py); 测仓库这份就把
+CPF_DEPLOY=0 设进环境变量, 或者直接改下面 DEP 那行。
+
+2026-10-20 重写: 旧版的断言停留在"6 段风扇曲线 / 10W 地板 / 标志 30 秒"那代,
+14 项一直红着, 等于没有回归保护。现在时间用打桩(time.time)推进, 不真等 60 秒。
 """
 import importlib.util
+import json
 import os
 import sys
 
-DEP = os.path.join(os.environ.get('APPDATA', ''), 'CpuPLFix')
-spec = importlib.util.spec_from_file_location('cpf', os.path.join(DEP, 'CpuPLFix.py'))
+USE_DEPLOY = os.environ.get('CPF_DEPLOY', '1') != '0'
+ROOT = os.path.join(os.environ.get('APPDATA', ''), 'CpuPLFix' if USE_DEPLOY else '_repo')
+if not USE_DEPLOY:
+    ROOT = os.path.join(os.environ.get('APPDATA', ''), '_repo')
+
+spec = importlib.util.spec_from_file_location('cpf', os.path.join(ROOT, 'CpuPLFix.py'))
 cpf = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cpf)
 
-cfg = cpf.load_cfg()
-FAIL = []
-
-
-def step(desc, got, want_sub):
-    ok = (got is not None and want_sub in got) if want_sub else (got is None)
-    print('  [%s] %-46s -> %s' % ('OK' if ok else '!!', desc, (got or '(无变化)')[:70]))
-    if not ok:
-        FAIL.append(desc)
-
-
-g = cfg['guard']
-w, c, e, r = g['warn_c'], g['crit_c'], g['escape_c'], g['recover_c']
-
-print('=== guard_apply: 温度线（阈值直接读 config：预警 %g / 严重 %g / 逃生 %g / 解除 %g） ===' % (w, c, e, r))
-cpf._G['level'] = None
-step('EC %g°C (低于预警)' % (w - 1), cpf.guard_apply(cfg, w - 1, None, {0x89: 0, 0x8A: 0, 0x8B: 0}), None)
-step('EC %g°C (到预警)' % w, cpf.guard_apply(cfg, w, None, {}), '预警')
-step('EC %g°C (同档不重复报)' % (w + 1), cpf.guard_apply(cfg, w + 1, None, {}), None)
-step('EC %g°C (到严重)' % c, cpf.guard_apply(cfg, c, None, {}), '严重')
-step('EC %g°C (到逃生)' % e, cpf.guard_apply(cfg, e, None, {}), '逃生')
-step('EC %g°C (逃生->严重, 降档也是一次变化)' % (e - 5), cpf.guard_apply(cfg, e - 5, None, {}), '严重')
-step('EC %g°C (同上, 不重复报)' % (e - 5), cpf.guard_apply(cfg, e - 5, None, {}), None)
-step('EC %g°C -> 解除(%g<=%g)' % (r - 1, r - 1, r), cpf.guard_apply(cfg, r - 1, None, {}), '解除')
-
-print('=== guard_apply: 固件标志线(0x89/0x8A/0x8B, 需连续两轮确认) ===')
-cpf._G['level'] = None
-cpf._G['trip_hits'] = 0
-step('EC 60°C 第 1 轮读到 0x8A 置位 -> 只提示, 不动手',
-     cpf.guard_apply(cfg, 60, None, {0x89: 0, 0x8A: 0x01, 0x8B: 0}), '再确认一轮')
-step('第 2 轮仍读到 -> 最高级', cpf.guard_apply(cfg, 60, None, {0x89: 0, 0x8A: 0x01, 0x8B: 0}), '固件标志')
-step('第 3 轮仍读到(同档不重复报)', cpf.guard_apply(cfg, 60, None, {0x89: 0, 0x8A: 0x01, 0x8B: 0}), None)
-step('单轮毛刺(读到一轮后又没了) -> 不动作, 60<=78 于是解除',
-     cpf.guard_apply(cfg, 60, None, {0x89: 0x80}), '解除')
-step('EC 60°C 标志全零(已解除) -> 不再重复报', cpf.guard_apply(cfg, 60, None, {0x89: 0, 0x8A: 0, 0x8B: 0}), None)
-cpf._G['level'] = None
-cpf._G['trip_hits'] = 0
-step('trip_flags=false 时标志被忽略', cpf.guard_apply({'guard': {'trip_flags': False}}, 60, None, {0x8A: 1}), None)
-
-print('=== guard_apply: DTS 只做兜底 ===')
-cpf._G['level'] = None
-step('EC 70°C + DTS 99°C (EC 可信, 不该动)', cpf.guard_apply(cfg, 70, 99, {}), None)
-step('EC 读不到 + DTS 99°C -> 严重(兜底)', cpf.guard_apply(cfg, None, 99, {}), '严重')
-cpf._G['level'] = None
-cpf.set_pl_override(None)
-
-print('=== fan_level_of: 升降档与回差 ===')
-curve = cpf.fan_cfg(cfg)['curve']
-hyst = float(cpf.fan_cfg(cfg)['hyst'])
-print('  曲线 %s   回差 %g°C' % (curve, hyst))
-prev = None
-seq = [(40, 2), (60, 2), (62, 2), (63, 6), (70, 6), (75, 6), (76, 64), (80, 64),
-       (71, 64), (70, 6), (62, 6), (58, 6), (57, 2), (55, 2), (50, 2)]
-for t, want in seq:
-    lv, idx = cpf.fan_level_of(t, curve, prev, hyst)
-    prev = idx
-    ok = (lv == want)
-    print('    [%s] %5s°C -> 档位 %-3s (段 %d)   期望 %s'
-          % ('OK' if ok else '!!', t, lv, idx, want))
-    if not ok:
-        FAIL.append('fan_level_of @%s°C 期望档位 %s, 得到 %s' % (t, want, lv))
-
-print('=== EC 解析函数 ===')
-print('  ec_tripped({0x89:0,0x8A:0,0x80,0x8B:0}) =', cpf.ec_tripped({0x89: 0, 0x8A: 0x80, 0x8B: 0}))
-print('  flags_desc =', cpf.flags_desc({0x89: 0, 0x8A: 0x80, 0x8B: None}))
-print('  EC_TRIP_FLAGS =', ['0x%02X' % h for h in cpf.EC_TRIP_FLAGS])
-
-print('=== 轮询节奏 poll_plan: 少打扰 EC ===')
+PASS = FAIL = 0
 
 
 def chk(desc, ok, extra=''):
-    print('  [%s] %-46s %s' % ('OK' if ok else '!!', desc, extra))
-    if not ok:
-        FAIL.append(desc)
+    global PASS, FAIL
+    if ok:
+        PASS += 1
+        print('  [OK] %-52s %s' % (desc, extra))
+    else:
+        FAIL += 1
+        print('  [!!] %-52s %s' % (desc, extra))
 
 
+# ---------------------------------------------------------------- 打桩
+NOW = [1000.0]
+cpf.time.time = lambda: NOW[0]
+PL = []
+cpf.set_pl_override = lambda a, b=None: PL.append((a, b))
+cpf.on_ac = lambda: True
+
+CFG = {
+    'pl1_w': 28.0, 'pl2_w': 55.0, 'pl1_w_batt': 20.0, 'pl2_w_batt': 28.0,
+    'fan': {'mode': 'curve', 'level': 0, 'curve': [[56, 2], [79, 6], [999, 64]],
+            'hyst': 5.0, 'min_dwell_s': 60.0, 'load_boost_pct': 70.0,
+            'load_boost_s': 10.0, 'load_boost_level': 64, 'load_hold_s': 30.0,
+            'min_write_gap_s': 10.0, 'dts_max_c': 92.0},
+    'guard': {
+        'enabled': True, 'warn_c': 95.0, 'crit_c': 98.0, 'escape_c': 105.0,
+        'crit_now_c': 100.0, 'crit_hold_s': 10.0, 'step_dwell_s': 15.0,
+        'recover_c': 78.0, 'min_hold_s': 30.0, 'release_dwell_s': 10.0,
+        'flag_release_c': 97.0, 'flag_release_s': 60.0,
+        'flag_pl1_w': 20.0, 'flag_pl2_w': 28.0,
+        'warn_pl1_w': 0.0, 'warn_pl2_w': 40.0,
+        'crit_pl1_w': 28.0, 'crit_pl2_w': 35.0,
+        'crit2_pl1_w': 20.0, 'crit2_pl2_w': 25.0,
+        'crit3_pl1_w': 12.0, 'crit3_pl2_w': 14.0,
+        'ramp_pls': [[20.0, 25.0], [28.0, 35.0]], 'ramp_step_s': 30.0,
+        'trip_flags': True, 'temp_power': False, 'dts_crit_c': 97.0,
+        'cool_tail_s': 30.0,
+    },
+}
+FLAG_ON = {0x89: 0x01, 0x8A: 0x00, 0x8B: 0x00}
+FLAG_OFF = {0x89: 0x00, 0x8A: 0x00, 0x8B: 0x00}
+
+
+def reset(t0=1000.0):
+    NOW[0] = t0
+    del PL[:]
+    for k in list(cpf._G.keys()):
+        cpf._G[k] = None
+    cpf._G.update({'level': None, 'since': 0.0, 'hibernate': False, 'last_et': None,
+                   'trip_hits': 0, 'trip_since': None, 'trip_latched': False,
+                   'cool_since': None, 'released_at': 0.0, 'crit_since': None,
+                   'step': 0, 'step_since': 0.0, 'why': '', 'ramp': None, 'ramp_at': 0.0,
+                   'clr_hits': 0, 'flag_ok_since': None})
+
+
+def tick(et, dts=None, flags=None, fresh=True, dt=0.0):
+    NOW[0] += dt
+    return cpf.guard_apply(CFG, et, dts, flags if flags is not None else FLAG_OFF,
+                           flags_fresh=fresh)
+
+
+# ================================================================ 1. 温度线
+print('=== 1. 温度线: 95 预警 / 98 驻留 10 秒 / 100 立即 / 105 逃生 ===')
+reset()
+chk('EC 94°C 不动', tick(94) is None, 'level=%r' % cpf._G['level'])
+m = tick(95)
+chk('EC 95°C -> 预警', m is not None and '预警' in m, (m or '')[:40])
+chk('EC 96°C 同档不重复报', tick(96) is None)
+chk('EC 98°C 第 1 次: 驻留中, 仍是预警', cpf._G['level'] == 'warn',
+    'level=%r' % cpf._G['level'])
+tick(98)                                   # 第一次触 98 才开始计驻留
+m = tick(98, dt=10.0)
+chk('驻留满 10 秒 -> 严重', cpf._G['level'] == 'crit' and '严重' in (m or ''),
+    'level=%r' % cpf._G['level'])
+reset()
+m = tick(100)
+chk('单次 100°C(=crit_now_c) 立即严重', cpf._G['level'] == 'crit', 'level=%r' % cpf._G['level'])
+m = tick(105)
+chk('EC 105°C -> 逃生(第三级)', cpf._G['level'] == 'crit3', 'level=%r' % cpf._G['level'])
+
+print('=== 2. 三级阶梯: 每级 step_dwell_s(15 秒) 深一级 ===')
+reset()
+tick(100)                                  # 立即 crit
+m = tick(99, dt=15.0)
+chk('15 秒后 -> 第二级 20/25', cpf._G['level'] == 'crit2', 'level=%r' % cpf._G['level'])
+m = tick(99, dt=15.0)
+chk('再 15 秒 -> 第三级 12/14', cpf._G['level'] == 'crit3', 'level=%r' % cpf._G['level'])
+chk('地板是 12/14(不是 10W)', cpf._G.get('level') == 'crit3')
+
+print('=== 3. 解除: min_hold_s(30) + release_dwell_s(10) 都要满足 ===')
+reset()
+tick(100)                                  # 进 crit, since=NOW
+NOW[0] += 20.0
+tick(77)
+chk('驻留不足 30 秒: 不解除', cpf._G['level'] == 'crit', 'level=%r' % cpf._G['level'])
+NOW[0] += 15.0                             # 累计 35 秒 > 30
+tick(77)                                   # cool_since 从这里起算
+chk('刚进降温窗口: 还不解除', cpf._G['level'] == 'crit')
+NOW[0] += 10.0
+m = tick(77)
+chk('降温稳住 10 秒 -> 解除', cpf._G['level'] is None and '解除' in (m or ''),
+    'level=%r' % cpf._G['level'])
+chk('解除后走分级回升(先 20/25)', cpf._G.get('ramp') is not None and PL[-1] == (20.0, 25.0),
+    'ramp=%r PL=%r' % (cpf._G.get('ramp'), PL[-1] if PL else None))
+
+# ================================================================ 4. 固件标志
+print('=== 4. 固件标志: 两轮确认 / 读失败不放开 / 97°C 60 秒判锁存 ===')
+reset()
+m = tick(90, flags=FLAG_ON)
+chk('第 1 轮只提示', m is not None and '再确认' in m, (m or '')[:30])
+m = tick(90, flags=FLAG_ON)
+chk('第 2 轮 -> flag 档 20/28', cpf._G['level'] == 'flag' and PL[-1] == (20.0, 28.0),
+    'level=%r PL=%r' % (cpf._G['level'], PL[-1] if PL else None))
+for _ in range(6):                          # 30 秒, 全部"沿用缓存"
+    tick(90, flags=FLAG_ON, fresh=False, dt=5.0)
+chk('读失败(沿用缓存)不放开', cpf._G['level'] == 'flag', 'level=%r' % cpf._G['level'])
+for _ in range(7):                          # 再 35 秒, 累计 65 秒
+    tick(90, flags=FLAG_ON, dt=5.0)
+chk('连续 ≤97°C 满 60 秒 -> 判锁存放开', bool(cpf._G.get('trip_latched')),
+    'latched=%r level=%r' % (cpf._G.get('trip_latched'), cpf._G['level']))
+chk('锁存放开是 sticky(标志还挂着也不回 flag)',
+    tick(90, flags=FLAG_ON, dt=5.0) is None and cpf._G['level'] is None,
+    'level=%r' % cpf._G['level'])
+
+print('=== 5. 97 边界: 96 不重置 / 98 重置并交给温度线 ===')
+reset()
+tick(90, flags=FLAG_ON); tick(90, flags=FLAG_ON)      # 进 flag
+for _ in range(6):
+    tick(90, flags=FLAG_ON, dt=5.0)                   # 30 秒
+tick(96, flags=FLAG_ON, dt=5.0)
+chk('96°C 不重置计时', cpf._G.get('flag_ok_since') is not None,
+    'since=%r' % cpf._G.get('flag_ok_since'))
+reset()
+tick(90, flags=FLAG_ON); tick(90, flags=FLAG_ON)
+for _ in range(6):
+    tick(90, flags=FLAG_ON, dt=5.0)
+tick(98, flags=FLAG_ON, dt=5.0)
+chk('98°C 重置计时', cpf._G.get('flag_ok_since') is None)
+chk('98°C 时不判锁存', not cpf._G.get('trip_latched'))
+
+print('=== 6. 标志清零: 连续两轮真读才解除锁存 ===')
+reset()
+tick(90, flags=FLAG_ON); tick(90, flags=FLAG_ON)
+for _ in range(13):
+    tick(90, flags=FLAG_ON, dt=5.0)                   # 65 秒 -> 锁存
+chk('前置: 已锁存', bool(cpf._G.get('trip_latched')))
+tick(60, flags=FLAG_OFF, dt=5.0)
+chk('清零 1 轮: 仍锁存', bool(cpf._G.get('trip_latched')),
+    'clr_hits=%r' % cpf._G.get('clr_hits'))
+m = tick(60, flags=FLAG_OFF, dt=5.0)
+chk('清零 2 轮: 解除锁存', not cpf._G.get('trip_latched') and '清零' in (m or ''),
+    (m or '')[:40])
+
+# ================================================================ 7. 风扇曲线
+print('=== 7. fan_level_of: 三段曲线 + 5°C 回差 ===')
+curve = [[56, 2], [79, 6], [999, 64]]
+hyst = 5.0
+seq = [(40, 2), (55, 2), (56, 6), (70, 6), (78, 6), (79, 64), (80, 64),
+       (75, 64), (74, 64), (73, 6), (60, 6), (52, 6), (51, 6), (50, 2), (40, 2)]
+prev = None
+bad = []
+for t, want in seq:
+    lv, idx = cpf.fan_level_of(t, curve, prev, hyst)
+    prev = idx
+    if lv != want:
+        bad.append('%d°C 期望 %s 得到 %s' % (t, want, lv))
+chk('15 个温度点全部符合(含回差)', not bad, '; '.join(bad[:3]))
+
+# ================================================================ 8. 节奏
+print('=== 8. poll_plan: 凉机 120 / 保护期 5-5-15 / 开机 2-5-10 ===')
 d = cpf.poll_plan(dict(cpf.DEFAULT_CFG))
-chk('默认 主循环/EC/标志 = %.0f/%.0f/%.0f 秒' % d, d == (5.0, 15.0, 30.0), '(DEFAULT_CFG)')
-chk('没配节奏项时用默认值', cpf.poll_plan({}) == (5.0, 15.0, 30.0))
-r = cpf.poll_plan(cfg)
-chk('部署 config 的节奏 = %.0f/%.0f/%.0f 秒' % r, r[1] >= 10.0,
-    'EC 读间隔应 >= 10 秒(降频确实生效)')
-chk('开机前 5 分钟自动加密(EC<=5 秒)', cpf.poll_plan(cfg, fast=True)[1] <= 5.0)
-gp = cpf.poll_plan(cfg, guard=True)
-chk('保护生效: EC 读提到跟主循环同频', gp[1] == gp[0], '%s' % (gp,))
-hp = cpf.poll_plan(cfg, hot=True)
-chk('温度 > flag_hot_c: 标志跟 EC 同频', hp[2] == hp[1], '%s' % (hp,))
-chk('乱填 0/负数也不会变成疯读',
+chk('默认(凉机) 5/15/120 秒', d == (5.0, 15.0, 120.0), '%r' % (d,))
+chk('没配节奏项时同默认', cpf.poll_plan({}) == (5.0, 15.0, 120.0))
+gp = cpf.poll_plan(dict(cpf.DEFAULT_CFG), guard=True)
+chk('保护期 5/5/15 秒(标志不再 5 秒)', gp == (5.0, 5.0, 15.0), '%r' % (gp,))
+fp = cpf.poll_plan(dict(cpf.DEFAULT_CFG), fast=True)
+chk('开机前 5 分钟 2/5/10 秒', fp == (2.0, 5.0, 10.0), '%r' % (fp,))
+hp = cpf.poll_plan(dict(cpf.DEFAULT_CFG), hot=True)
+chk('温度高时标志跟 EC 同频', hp[2] == hp[1], '%r' % (hp,))
+chk('乱填 0/负数不会疯读',
     min(cpf.poll_plan({'poll_s': 0, 'ec_poll_s': -1, 'flag_poll_s': 0})) >= 1.0)
-chk('flag_hot_c 读得到(默认 85)', abs(cpf.flag_hot_c({}) - 85.0) < 0.01)
-import inspect
-chk('tick 支持 ec/read_flags: %s' % str(inspect.signature(cpf.tick)),
-    'ec' in str(inspect.signature(cpf.tick)) and 'read_flags' in str(inspect.signature(cpf.tick)))
 
-print('=== 标志缓存不当新证据(flags_fresh=False) ===')
-cpf._G['level'] = None
-cpf._G['trip_hits'] = 0
-cpf.guard_apply(cfg, 60, None, {0x8A: 1})                        # 真读第 1 轮
-cpf.guard_apply(cfg, 60, None, {0x8A: 1}, flags_fresh=False)     # 缓存轮
-cpf.guard_apply(cfg, 60, None, {0x8A: 1}, flags_fresh=False)     # 缓存轮
-chk('缓存值反复传不会自己凑成"连续两轮"', cpf._G['level'] is None,
-    'trip_hits=%s level=%s' % (cpf._G.get('trip_hits'), cpf._G['level']))
-chk('第 2 次真读才确认', '固件标志' in (cpf.guard_apply(cfg, 60, None, {0x8A: 1}) or ''))
-cpf._G['level'] = None
-cpf._G['trip_hits'] = 0
-cpf.set_pl_override(None)
+# ================================================================ 9. 时间窗解码
+print('=== 9. MSR 0x610 时间窗: _tau_s 必须与 _pl_time 一致 ===')
+v = 0x004281B800238140          # 本机实测值
+t1, t2 = (v >> 16) & 0xFF, (v >> 48) & 0xFF
+chk('PL1 35 -> 8 秒', cpf._tau_s(t1) == '8 秒', '_tau_s=%r _pl_time=%.1f'
+    % (cpf._tau_s(t1), cpf._pl_time(v, 16)))
+chk('PL2 66 -> 5 秒', cpf._tau_s(t2) == '5 秒', '_tau_s=%r _pl_time=%.1f'
+    % (cpf._tau_s(t2), cpf._pl_time(v, 48)))
+chk('两个解码器结果一致(PL1)',
+    cpf._tau_s(t1) == '%.0f 秒' % cpf._pl_time(v, 16))
+chk('两个解码器结果一致(PL2)',
+    cpf._tau_s(t2) == '%.0f 秒' % cpf._pl_time(v, 48))
+
+# ================================================================ 10. merge_flags
+print('=== 10. merge_flags: 读失败沿用上一轮, 且 complete=False ===')
+mf = cpf.merge_flags
+# 签名是 merge_flags(new=本轮, old=上一轮)
+f, ok = mf({0x89: None, 0x8A: None, 0x8B: None}, {0x89: 1, 0x8A: 0, 0x8B: 0})
+chk('本轮全读失败 -> 沿用上一轮, complete=False',
+    f.get(0x89) == 1 and ok is False, 'merged=%r ok=%r' % (f, ok))
+f, ok = mf({0x89: 0, 0x8A: 0, 0x8B: 0}, {0x89: 0, 0x8A: 0, 0x8B: 0})
+chk('本轮全读到 -> complete=True', ok is True)
+f, ok = mf(None, {0x89: None, 0x8A: None, 0x8B: None})
+chk('无历史且全失败 -> 值仍是 None, complete=False',
+    f.get(0x89) is None and ok is False, 'merged=%r ok=%r' % (f, ok))
+chk('ec_tripped 跳过 None', cpf.ec_tripped({0x89: None, 0x8A: 0, 0x8B: 0}) == [])
+chk('flags_desc 把 None 显示成 --', '--' in cpf.flags_desc({0x89: None, 0x8A: 0, 0x8B: 0}))
+
+# ================================================================ 11. 配置工具
+print('=== 11. 3-config: hold= 同时写 trip_hold_s / flag_release_s ===')
+spec2 = importlib.util.spec_from_file_location(
+    'cfgmod', os.path.join(ROOT, 'CpuPLFixCfg.py'))
+m2 = importlib.util.module_from_spec(spec2)
+spec2.loader.exec_module(m2)
+import copy
+c = copy.deepcopy(CFG)
+m2.apply_kv(c, 'hold', '90')
+chk('hold=90 -> 两个键都写', c['guard'].get('trip_hold_s') == 90.0
+    and c['guard'].get('flag_release_s') == 90.0,
+    'trip=%r flag=%r' % (c['guard'].get('trip_hold_s'), c['guard'].get('flag_release_s')))
+c2 = copy.deepcopy(CFG)
+m2.apply_kv(c2, 'flag_rel', '97,60')
+chk('flag_rel=97,60 -> guard 值',
+    (c2['guard'].get('flag_release_c'), c2['guard'].get('flag_release_s')) == (97.0, 60.0))
+
+# ================================================================ 12. 真实配置
+print('=== 12. 实机 config.json 的关键取值 ===')
+try:
+    real = json.load(open(os.path.join(ROOT, 'config.json'), encoding='utf-8'))
+    rg = real.get('guard') or {}
+    chk('flag_release_c = 97', rg.get('flag_release_c') == 97.0, '= %r' % rg.get('flag_release_c'))
+    chk('flag_release_s = 60', rg.get('flag_release_s') == 60.0, '= %r' % rg.get('flag_release_s'))
+    chk('97 < crit_c', 97.0 < float(rg.get('crit_c') or 98.0), 'crit_c=%r' % rg.get('crit_c'))
+    chk('pl1_w = 28 / pl2_w = 55',
+        (real.get('pl1_w'), real.get('pl2_w')) == (28.0, 55.0),
+        '%r' % ((real.get('pl1_w'), real.get('pl2_w')),))
+except Exception as e:
+    chk('读 config.json', False, repr(e))
 
 print()
-print('失败项: %d' % len(FAIL))
-for f in FAIL:
-    print('  - ' + f)
+print('结果: %d 通过 / %d 失败' % (PASS, FAIL))
+if FAIL:
+    print('失败明细见上面的 [!!] 行')
 sys.exit(1 if FAIL else 0)

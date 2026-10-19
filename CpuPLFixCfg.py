@@ -165,8 +165,8 @@ def show(cfg):
     print('  ramp=%g            解除后每级回升秒数（0=直接回原档）'
           % g.get('ramp_step_s', 30.0))
     print('  flag_rel=%g,%g    标志挂着但温度连续 ≤该线 达该秒数 -> 判固件锁存、自动放开'
-          '（0 秒=不自动解除）'
-          % (g.get('flag_release_c', g.get('warn_c', 95.0)), g.get('flag_release_s', 60.0)))
+          '（0 秒=不自动解除；该线默认 97，低于 crit_c 98）'
+          % (g.get('flag_release_c', 97.0), g.get('flag_release_s', 60.0)))
     print('  warn_pl2=%g        预警档只把 PL2 收到这里（PL1 不动；warn_pl1_w>0 才压 PL1）'
           % g.get('warn_pl2_w', 40.0))
     print()
