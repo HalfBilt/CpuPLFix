@@ -14,6 +14,12 @@
     CpuPLFixCfg.py fan_dts=92 DTS 前馈：核心温度到 92°C 立刻拉满风扇
     CpuPLFixCfg.py flag_slow=120 凉机时固件标志读的间隔（秒）
     CpuPLFixCfg.py cool_tail=30 退出过热保护后继续满速 30 秒
+    CpuPLFixCfg.py warn_pl2=40 预警档只收 PL2 到 40W（PL1 不动）
+    CpuPLFixCfg.py crit_hold=10 严重档驻留 10 秒（压不下来才算数）
+    CpuPLFixCfg.py step_dwell=15 每级压 15 秒没效果就再深一级
+    CpuPLFixCfg.py ramp=30 解除后每级回升 30 秒
+    CpuPLFixCfg.py crit2=20,25 第二级功耗墙（PL1,PL2）
+    CpuPLFixCfg.py crit3=12,14 地板级功耗墙（PL1,PL2）
     CpuPLFixCfg.py undo        撤销上一次保存
     CpuPLFixCfg.py raw         打印完整 JSON
 
@@ -140,6 +146,19 @@ def show(cfg):
           % (g.get('min_hold_s', 30.0), g.get('release_dwell_s', 10.0)))
     print('  cool_tail=%g       退出保护后继续满速这么久（秒，缓冲功率阶跃）'
           % g.get('cool_tail_s', 30.0))
+    print('  严重档三级          %.0f/%.0fW -> %.0f/%.0fW -> %.0f/%.0fW（PBP -> Minimum '
+          'Assured Power -> 地板）'
+          % (g.get('crit_pl1_w', 28.0), g.get('crit_pl2_w', 35.0),
+             g.get('crit2_pl1_w', 20.0), g.get('crit2_pl2_w', 25.0),
+             g.get('crit3_pl1_w', 12.0), g.get('crit3_pl2_w', 14.0)))
+    print('  crit_hold=%g       驻留：持续这么久 ≥严重线才进严重档（0=碰线就动作）'
+          % g.get('crit_hold_s', 10.0))
+    print('  step_dwell=%g      每级停留这么久还压不下来就再深一级（秒）'
+          % g.get('step_dwell_s', 15.0))
+    print('  ramp=%g            解除后每级回升秒数（0=直接回原档）'
+          % g.get('ramp_step_s', 30.0))
+    print('  warn_pl2=%g        预警档只把 PL2 收到这里（PL1 不动；warn_pl1_w>0 才压 PL1）'
+          % g.get('warn_pl2_w', 40.0))
     print()
     print('改值：3-config.bat ac=40,55   |   撤销：3-config.bat undo   |   全部用法：3-config.bat help')
     print()
@@ -148,6 +167,14 @@ def show(cfg):
 # ---------------------------------------------------------------- 解析
 class Fail(Exception):
     pass
+
+
+def _pair(val, what):
+    """解析 "28,35" 这种 PL1,PL2 对。"""
+    parts = str(val).replace('/', ',').split(',')
+    if len(parts) != 2:
+        raise SystemExit('%s 要写成 PL1,PL2（例如 20,25），收到的是 %r' % (what, val))
+    return (_num(parts[0], 3, 200, what + ' 的 PL1'), _num(parts[1], 3, 200, what + ' 的 PL2'))
 
 
 def _num(v, lo, hi, name, integer=False, allow_zero=False):
@@ -290,6 +317,20 @@ def apply_kv(cfg, key, val):
         f['min_write_gap_s'] = _num(val, 0, 300, '风扇写入最小间隔秒数（0=关）', allow_zero=True)
     elif k == 'flag_slow':
         cfg['flag_poll_slow_s'] = _num(val, 2, 3600, '凉机标志读间隔秒数', allow_zero=True)
+    elif k == 'warn_pl2':
+        g['warn_pl2_w'] = _num(val, 15, 200, '预警档只收 PL2 到多少瓦')
+    elif k == 'crit_hold':
+        g['crit_hold_s'] = _num(val, 0, 600, '严重档驻留秒数（0=碰线就动作）', allow_zero=True)
+    elif k == 'step_dwell':
+        g['step_dwell_s'] = _num(val, 3, 600, '每级停留秒数（压不下来就再深一级）')
+    elif k == 'ramp':
+        g['ramp_step_s'] = _num(val, 0, 600, '解除后每级回升秒数（0=直接回原档）', allow_zero=True)
+    elif k == 'crit2':
+        p = _pair(val, '第二级')
+        g['crit2_pl1_w'], g['crit2_pl2_w'] = p
+    elif k == 'crit3':
+        p = _pair(val, '地板级')
+        g['crit3_pl1_w'], g['crit3_pl2_w'] = p
     elif k == 'cool_tail':
         g['cool_tail_s'] = _num(val, 0, 600, '保护退出后继续满速秒数（0=关）', allow_zero=True)
     elif k == 'hibernate':
