@@ -75,7 +75,9 @@
         28.0,
         35.0
       ]
-    ]
+    ],
+    "flag_release_c": 95.0,
+    "flag_release_s": 60.0
   },
   "comment": "本机实用配置。插电(AC): PL1=28W(=i7-1360P 的 PBP) PL2=55W(突发, 时间窗 6 秒); 电池: PL1=20W(Minimum Assured Power) PL2=28W。PPC: 温度墙按\"驻留+三级阶梯\"(2026-10-19 改): 预警 95°C 只收 PL2 到 40W(PL1 不动); 严重 98°C 持续 10 秒(或单次到 100°C=TjMax) -> 28/35W -> 每 15 秒还压不下来就 20/25W -> 12/14W; 解除(EC<=78°C 稳住 10 秒)后按 20/25 -> 28/35 -> 原档每级 30 秒回升。mmio_mode=disable: 开机把固件侧 MMIO 清零+锁, 之后只写 MSR, 改配置/拔插电免重启。poll_s/ec_poll_s/flag_poll_s=主循环/EC读/固件标志读秒数(默认 5/15/30; 凉机标志读降到 flag_poll_slow_s=120 秒, 少打扰 EC)。fan.min_dwell_s=降温降档最短驻留; fan.min_write_gap_s=非紧急写入最小间隔(只压降档); fan.dts_max_c=DTS 前馈立刻拉满。",
   "flag_poll_slow_s": 120.0

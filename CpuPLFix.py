@@ -148,6 +148,13 @@ DEFAULT_CFG = {
         "flag_pl1_w": 20.0,
         "flag_pl2_w": 28.0,
         "trip_hold_s": 45.0,
+        # ★2026-10-19(用户指出后加): 标志档的"温度正常持续一段时间就自动解除"出口。
+        #   标志挂着 + 温度连续 <= flag_release_c 达 flag_release_s 秒 -> 判"固件锁存位,
+        #   不是真过热" -> 分级回升放开, 并保持放开(标志清零前不再据此降档)。
+        #   默认 flag_release_c = 预警线(95°C): 低于预警线就算"温度正常"。
+        #   flag_release_s = 0 表示关掉这条出口(退回"标志不清零就一直压着"的老行为)。
+        "flag_release_c": 95.0,
+        "flag_release_s": 60.0,
         "min_hold_s": 30.0,
         "release_dwell_s": 10.0,
         # ★保护退出后继续拉满风扇这么久(秒, 2026-10-19 加): "10W -> 40W" 是个功率阶跃,
@@ -1304,7 +1311,7 @@ _G = {'level': None, 'since': 0.0, 'hibernate': False, 'last_et': None, 'trip_hi
       'trip_since': None, 'trip_latched': False, 'cool_since': None, 'released_at': 0.0,
       # ★2026-10-19 温度墙分级所需
       'crit_since': None, 'step': 0, 'step_since': 0.0, 'why': '', 'ramp': None, 'ramp_at': 0.0,
-      'clr_hits': 0}
+      'clr_hits': 0, 'flag_ok_since': None}
 
 
 def _gv(g, key, default):
@@ -1382,6 +1389,7 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
     desc = ', '.join('0x%02X=0x%02X' % (h, v) for h, v in hit)
     if not hit:
         _G['trip_since'] = None
+        _G['flag_ok_since'] = None
         # ★2026-10-19(补 06d4e01 漏掉的一半): 清零也要连续两轮真读才认 —— 而且**不管有没有
         #   进过"锁存"**。原来这段只写在 trip_latched 分支里, 可实测的抖动根本不进那个分支
         #   (trip_hold_s=45 秒永远追不上 42~44 秒的温度解除), 所以 clr_hits 一次都没生效。
@@ -1406,19 +1414,41 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
         _G['clr_hits'] = 0
         if _G.get('trip_since') is None:
             _G['trip_since'] = time.time()
-        if (hold > 0 and not _G.get('trip_latched')
-                and et is not None and et <= g['recover_c']
-                and time.time() - _G['trip_since'] >= hold):
-            _G['trip_latched'] = True
-            _G['trip_since'] = time.time()
-            _G['level'] = None
-            _G['step'] = 0
-            _G['ramp'] = None
-            set_pl_override(None)
-            return ('固件过热标志 %s 已挂 %.0f 秒, 而 EC 只有 %d°C(≤ %.0f°C) —— 判定为'
-                    '**固件把标志锁住了**, 不是真过热。已恢复正常功耗墙, 标志清零前不再'
-                    '据此降档(温度线 %g/%g 仍然有效)。彻底清掉它要断电重启。'
-                    % (desc, hold, et, g['recover_c'], g['warn_c'], g['crit_c']))
+        # ---- ★标志档的"温度正常持续一段时间就解除"(2026-10-19 用户指出后加) ----------
+        # 旧条件要求"EC <= recover_c(78°C) 满 45 秒"才算锁存, 而 78°C 在本机偏苛刻:
+        # 28W 满载的稳态就是 89~95°C —— 于是标志一挂上, 只要温度在 78~95°C 之间就被
+        # **永久**压在 20/28W(不再自动放开)。现在改成:
+        #   连续 (ET <= flag_release_c, 默认 = 预警线 95°C) 达 flag_release_s(默认 60 秒)
+        #   -> 判"固件锁存位, 不是真过热" -> 分级回升放开并保持(sticky)。
+        # 关键是"连续": 中途温度升过线, 计时从头来 —— 所以不会 60 秒来回切。
+        _rc = g.get('flag_release_c')
+        rel_c = float(g['warn_c'] if _rc is None else _rc)
+        _rs = g.get('flag_release_s')
+        if _rs is None:
+            _rs = g.get('trip_hold_s')            # 兼容旧配置: 旧键语义 = 锁存判定秒数
+        rel_s = 60.0 if _rs is None else float(_rs)
+        if et is not None and et > rel_c:
+            _G['flag_ok_since'] = None            # 升过"正常线" -> 计时重来
+        elif rel_s > 0 and not _G.get('trip_latched'):
+            if _G.get('flag_ok_since') is None:
+                _G['flag_ok_since'] = time.time()
+            if time.time() - _G['flag_ok_since'] >= rel_s:
+                _G['trip_latched'] = True
+                _G['trip_since'] = time.time()
+                _G['flag_ok_since'] = None
+                pname = profile_pl(cfg)[2]
+                _G['level'] = None
+                _G['step'] = 0
+                _G['released_at'] = time.time()
+                _G['ramp'] = [list(x) for x in (g.get('ramp_pls')
+                                                or [[20.0, 25.0], [28.0, 35.0]])] + [None]
+                _G['ramp_at'] = time.time()
+                set_pl_override(_G['ramp'][0][0], _G['ramp'][0][1])
+                return ('固件过热标志 %s 挂着, 但 EC 温度已连续 %.0f 秒 ≤ %.0f°C —— 判定为'
+                        '**固件锁存位**(不是真过热): 功耗墙分级回升到 [%s](先 %.0f/%.0fW), '
+                        '标志清零前不再据此降档; 温度线 %g/%g 全程有效。'
+                        % (desc, rel_s, rel_c, pname, _G['ramp'][0][0], _G['ramp'][0][1],
+                           g['warn_c'], g['crit_c']))
         if _G.get('trip_latched'):
             hit = []            # 锁存期间: 标志不再参与定级
 

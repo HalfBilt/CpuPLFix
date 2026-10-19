@@ -14,6 +14,7 @@
     CpuPLFixCfg.py fan_dts=92 DTS 前馈：核心温度到 92°C 立刻拉满风扇
     CpuPLFixCfg.py flag_slow=120 凉机时固件标志读的间隔（秒）
     CpuPLFixCfg.py cool_tail=30 退出过热保护后继续满速 30 秒
+    CpuPLFixCfg.py flag_rel=95,60 标志挂着但温度连续 ≤95°C 满 60 秒就自动放开
     CpuPLFixCfg.py warn_pl2=40 预警档只收 PL2 到 40W（PL1 不动）
     CpuPLFixCfg.py crit_hold=10 严重档驻留 10 秒（压不下来才算数）
     CpuPLFixCfg.py step_dwell=15 每级压 15 秒没效果就再深一级
@@ -157,6 +158,9 @@ def show(cfg):
           % g.get('step_dwell_s', 15.0))
     print('  ramp=%g            解除后每级回升秒数（0=直接回原档）'
           % g.get('ramp_step_s', 30.0))
+    print('  flag_rel=%g,%g    标志挂着但温度连续 ≤该线 达该秒数 -> 判固件锁存、自动放开'
+          '（0 秒=不自动解除）'
+          % (g.get('flag_release_c', g.get('warn_c', 95.0)), g.get('flag_release_s', 60.0)))
     print('  warn_pl2=%g        预警档只把 PL2 收到这里（PL1 不动；warn_pl1_w>0 才压 PL1）'
           % g.get('warn_pl2_w', 40.0))
     print()
@@ -317,6 +321,11 @@ def apply_kv(cfg, key, val):
         f['min_write_gap_s'] = _num(val, 0, 300, '风扇写入最小间隔秒数（0=关）', allow_zero=True)
     elif k == 'flag_slow':
         cfg['flag_poll_slow_s'] = _num(val, 2, 3600, '凉机标志读间隔秒数', allow_zero=True)
+    elif k == 'flag_rel':
+        p = _pair(val, '标志档自动解除')
+        g['flag_release_c'] = _num(p[0], 40, 105, '标志档解除温度线')
+        g['flag_release_s'] = _num(p[1], 0, 3600, '标志档解除秒数（0=不自动解除）',
+                                   allow_zero=True)
     elif k == 'warn_pl2':
         g['warn_pl2_w'] = _num(val, 15, 200, '预警档只收 PL2 到多少瓦')
     elif k == 'crit_hold':
