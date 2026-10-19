@@ -3555,6 +3555,16 @@ def temp_power_apply(cfg, et=None, dts=None):
     want = min(float(mp[idx][1]), ceiling)
     floor = float(g.get('temp_power_min') or 18.0)
     want = max(want, min(floor, ceiling))
+    # ★映射表是"风扇**满速**时"测出来的散热能力 —— 风扇没满速就不能按这张表给瓦数,
+    #   否则轻负载(风扇还在 6 档)时会把超出散热能力的瓦放出去。
+    #   所以: 风扇没到满速, 就只给"保守档"(temp_power_fanlow, 默认 28W = 今天的固定档);
+    #   等风扇满速了(高负载时前馈会拉满)才放开。这正是用户那个模型:
+    #   "高负载 → 风扇满速 → 功耗给到散热能力允许的上限"。
+    fan_lv = _FAN.get('lv')
+    if not (fan_lv is not None and fan_lv >= FAN_MAX):
+        cap = float(g.get('temp_power_fanlow') or 28.0)
+        if want > cap:
+            want = min(cap, ceiling)
     # 每轮最多改 TEMP_POWER_RATE 瓦, 防抖
     last = float(_G.get('tp_pl1') or 0.0)
     if _G.get('tp_on') and last > 0:
