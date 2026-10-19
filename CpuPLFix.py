@@ -1272,7 +1272,8 @@ _G = {'level': None, 'since': 0.0, 'hibernate': False, 'last_et': None, 'trip_hi
       'et_jump': False, 'et_hold': False, 'last_flags': {},
       'trip_since': None, 'trip_latched': False, 'cool_since': None, 'released_at': 0.0,
       # ★2026-10-19 温度墙分级所需
-      'crit_since': None, 'step': 0, 'step_since': 0.0, 'why': '', 'ramp': None, 'ramp_at': 0.0}
+      'crit_since': None, 'step': 0, 'step_since': 0.0, 'why': '', 'ramp': None, 'ramp_at': 0.0,
+      'clr_hits': 0}
 
 
 def _gv(g, key, default):
@@ -1335,6 +1336,8 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
         # "固件翻脸了"。沿用的缓存值既不算命中、也不清零: 它根本不是一轮读数, 要是让
         # 它清零, 标志读降到 30 秒一次后就得 60 秒才确认得了。
         _G['trip_hits'] = (_G.get('trip_hits', 0) + 1) if hit else 0
+        if hit:
+            _G['clr_hits'] = 0      # 看到标志就把"连着没标志"的计数清掉(串位读成 0 不算清零)
         if hit and _G['trip_hits'] == 1:
             return ('注意: 固件过热标志读到 %s —— 再确认一轮(下一轮仍读到就动作)'
                     % ', '.join('0x%02X=0x%02X' % (h, v) for h, v in hit))
@@ -1349,12 +1352,22 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
     if not hit:
         _G['trip_since'] = None
         if _G.get('trip_latched'):
-            _G['trip_latched'] = False
-            if _G['level'] == 'trip':
-                _G['level'] = None
-                set_pl_override(None)
-            return '固件过热标志已清零, 解除"锁存"判定(下次置位仍会正常保护)'
+            # ★2026-10-19 实机发现: 标志读会被 EC 串位读成 0 —— 单轮"读到 0"就解除锁存, 下一轮
+            #   又读回 1, 于是 flag(20/28) → 解除+回升 → flag 之间每 5 秒来回一次(日志可见)。
+            #   跟"置位也要连续两轮"对称: 清零也要求**连续两轮真读**都没标志。
+            if flags_fresh:
+                _G['clr_hits'] = int(_G.get('clr_hits') or 0) + 1
+            if _G['clr_hits'] >= 2:
+                _G['trip_latched'] = False
+                _G['clr_hits'] = 0
+                if _G['level'] in ('flag', 'trip'):
+                    _G['level'] = None
+                    _G['step'] = 0
+                    set_pl_override(None)
+                return ('固件过热标志已清零(连续两轮确认), 解除"锁存"判定'
+                        '(下次置位仍会正常保护)')
     elif _G.get('trip_hits', 0) >= 2:
+        _G['clr_hits'] = 0
         if _G.get('trip_since') is None:
             _G['trip_since'] = time.time()
         if (hold > 0 and et is not None and et <= g['recover_c']
