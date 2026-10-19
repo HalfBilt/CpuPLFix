@@ -49,7 +49,20 @@ def chk(desc, ok, extra=''):
 NOW = [1000.0]
 cpf.time.time = lambda: NOW[0]
 PL = []
-cpf.set_pl_override = lambda a, b=None: PL.append((a, b))
+
+
+def _fake_set_pl(a, b=None):
+    """模拟 set_pl_override: 记录调用**并**同步 _PL_OVERRIDE。
+
+    ★2026-10-20: 以前只 append 不更新 _PL_OVERRIDE, 于是 guard_apply 里
+    "解除时按当前档位过滤 ramp"那段读到 None, 永远走完整 ramp —— 测不出
+    "warn 档解除先把 PL1 压到 20W"这个缺陷。
+    """
+    PL.append((a, b))
+    cpf._PL_OVERRIDE = None if not a else (float(a), float(b or a))
+
+
+cpf.set_pl_override = _fake_set_pl
 cpf.on_ac = lambda: True
 
 CFG = {
@@ -80,6 +93,7 @@ FLAG_OFF = {0x89: 0x00, 0x8A: 0x00, 0x8B: 0x00}
 def reset(t0=1000.0):
     NOW[0] = t0
     del PL[:]
+    cpf._PL_OVERRIDE = None
     for k in list(cpf._G.keys()):
         cpf._G[k] = None
     cpf._G.update({'level': None, 'since': 0.0, 'hibernate': False, 'last_et': None,
@@ -136,8 +150,43 @@ NOW[0] += 10.0
 m = tick(77)
 chk('降温稳住 10 秒 -> 解除', cpf._G['level'] is None and '解除' in (m or ''),
     'level=%r' % cpf._G['level'])
-chk('解除后走分级回升(先 20/25)', cpf._G.get('ramp') is not None and PL[-1] == (20.0, 25.0),
-    'ramp=%r PL=%r' % (cpf._G.get('ramp'), PL[-1] if PL else None))
+chk('解除后 ramp 不把功耗压得比解除前更低', PL[-1][0] >= 28.0, 'PL[-1]=%r' % (PL[-1],))
+chk('解除后有回升阶梯', cpf._G.get('ramp') is not None, 'ramp=%r' % (cpf._G.get('ramp'),))
+
+print('=== 3b. ★解除时不许"反向降级"(审计发现的 bug) ===')
+reset()
+tick(95)                                   # warn 档: PL1 28 / PL2 40
+chk('warn 档 override = 28/40', cpf._PL_OVERRIDE == (28.0, 40.0), '%r' % (cpf._PL_OVERRIDE,))
+NOW[0] += 35
+tick(77)
+NOW[0] += 11
+m = tick(77)                               # 解除
+chk('warn 解除: PL1 不低于 28W(None=回原档, 也算对)',
+    cpf._PL_OVERRIDE is None or cpf._PL_OVERRIDE[0] >= 28.0,
+    'override=%r' % (cpf._PL_OVERRIDE,))
+chk('warn 解除: 直接回原档(ramp=None)', cpf._G.get('ramp') is None,
+    'ramp=%r' % (cpf._G.get('ramp'),))
+chk('warn 解除日志说"直接恢复原档"', '直接恢复原档' in (m or ''), (m or '')[:60])
+
+reset()
+tick(100)                                  # crit 档: 28/35
+NOW[0] += 35
+tick(77)
+NOW[0] += 11
+tick(77)
+chk('crit 解除: PL1 不低于 28W', (cpf._PL_OVERRIDE or (0, 0))[0] >= 28.0,
+    'override=%r' % (cpf._PL_OVERRIDE,))
+
+reset()
+tick(100)
+NOW[0] += 15
+tick(99)                                   # -> crit2 (20/25)
+NOW[0] += 35
+tick(77)
+NOW[0] += 11
+tick(77)
+chk('crit2 解除: 从 20/25 起(不跳过也不倒退)',
+    cpf._PL_OVERRIDE == (20.0, 25.0), 'override=%r' % (cpf._PL_OVERRIDE,))
 
 # ================================================================ 4. 固件标志
 print('=== 4. 固件标志: 两轮确认 / 读失败不放开 / 97°C 60 秒判锁存 ===')

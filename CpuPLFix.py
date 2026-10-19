@@ -1737,15 +1737,28 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
                 _G['level'] = None
                 _G['step'] = 0
                 _G['released_at'] = time.time()
-                _G['ramp'] = [list(x) for x in (g.get('ramp_pls')
-                                                or [[20.0, 25.0], [28.0, 35.0]])] + [None]
+                # ★2026-10-20 修(审计发现): 同温度解除那条路径 —— ramp 只往更宽松的方向走。
+                #   flag 档是 20/28, 从 ramp_pls[0]=20/25 起步会把 PL2 从 28 压到 25。
+                _cur = _PL_OVERRIDE
+                _steps = [list(x) for x in (g.get('ramp_pls')
+                                            or [[20.0, 25.0], [28.0, 35.0]])]
+                if _cur:
+                    _steps = [x for x in _steps
+                              if x[0] > _cur[0] + 1e-9
+                              or (abs(x[0] - _cur[0]) < 1e-9 and x[1] >= _cur[1] - 1e-9)]
+                _G['ramp'] = (_steps + [None]) if _steps else None
                 _G['ramp_at'] = time.time()
-                set_pl_override(_G['ramp'][0][0], _G['ramp'][0][1])
+                if _G['ramp']:
+                    set_pl_override(_G['ramp'][0][0], _G['ramp'][0][1])
+                    _tail = '分级回升到 [%s](先 %.0f/%.0fW)' % (
+                        pname, _G['ramp'][0][0], _G['ramp'][0][1])
+                else:
+                    set_pl_override(None)
+                    _tail = '直接恢复原档 [%s]' % pname
                 return ('固件过热标志 %s 挂着, 但 EC 温度已连续 %.0f 秒 ≤ %.0f°C —— 判定为'
-                        '**固件锁存位**(不是真过热): 功耗墙分级回升到 [%s](先 %.0f/%.0fW), '
+                        '**固件锁存位**(不是真过热): 功耗墙%s, '
                         '标志清零前不再据此降档; 温度线 %g/%g 全程有效。'
-                        % (desc, rel_s, rel_c, pname, _G['ramp'][0][0], _G['ramp'][0][1],
-                           g['warn_c'], g['crit_c']))
+                        % (desc, rel_s, rel_c, _tail, g['warn_c'], g['crit_c']))
         if _G.get('trip_latched'):
             hit = []            # 锁存期间: 标志不再参与定级
 
@@ -1840,14 +1853,30 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
             _G['step'] = 0
             _G['released_at'] = now      # ★风扇"尾巴"从这里起算(K3)
             # ★分级回升(2026-10-19): 不一步跳回原档, 免得温度二次冲顶
-            _G['ramp'] = [list(x) for x in (g.get('ramp_pls') or [[20.0, 25.0],
-                                                                 [28.0, 35.0]])] + [None]
-            _G['ramp_at'] = now
-            set_pl_override(_G['ramp'][0][0], _G['ramp'][0][1])
-            return ('过热保护解除(EC %d°C ≤ %.0f°C 且稳住 %.0f 秒): 功耗墙分级回升 [%s], '
-                    '原保护等级 %s —— 先给 PL1=%.0fW/PL2=%.0fW, 每 %.0f 秒抬一级'
-                    % (et, g['recover_c'], float(g.get('release_dwell_s') or 0.0), pname, old,
-                       _G['ramp'][0][0], _G['ramp'][0][1], _gv(g, 'ramp_step_s', 30.0)))
+            # ★2026-10-20 修(审计发现): ramp 只能往**更宽松**的方向走。以前无条件从
+            #   ramp_pls[0]=20/25 开始 —— 于是 warn 档(28/40)解除时先把 PL1 压到 20W、
+            #   crit 档(28/35)也一样: 温度降下来了反而更卡 30 秒(实测日志 23:43:56
+            #   "原保护等级 warn —— 先给 PL1=20W/PL2=25W")。现在把比解除前更严的级别
+            #   过滤掉, 只保留"继续往上抬"的那几级; 一级都不剩就直接回原档。
+            _cur = _PL_OVERRIDE
+            _steps = [list(x) for x in (g.get('ramp_pls') or [[20.0, 25.0], [28.0, 35.0]])]
+            if _cur:
+                _steps = [x for x in _steps
+                          if x[0] > _cur[0] + 1e-9
+                          or (abs(x[0] - _cur[0]) < 1e-9 and x[1] >= _cur[1] - 1e-9)]
+            if _steps:
+                _G['ramp'] = _steps + [None]
+                _G['ramp_at'] = now
+                set_pl_override(_G['ramp'][0][0], _G['ramp'][0][1])
+                return ('过热保护解除(EC %d°C ≤ %.0f°C 且稳住 %.0f 秒): 功耗墙分级回升 [%s], '
+                        '原保护等级 %s —— 先给 PL1=%.0fW/PL2=%.0fW, 每 %.0f 秒抬一级'
+                        % (et, g['recover_c'], float(g.get('release_dwell_s') or 0.0), pname, old,
+                           _G['ramp'][0][0], _G['ramp'][0][1], _gv(g, 'ramp_step_s', 30.0)))
+            _G['ramp'] = None
+            set_pl_override(None)
+            return ('过热保护解除(EC %d°C ≤ %.0f°C 且稳住 %.0f 秒): 功耗墙直接恢复原档 [%s] '
+                    '(原保护等级 %s 只压了 PL2, 不需要分级回升)'
+                    % (et, g['recover_c'], float(g.get('release_dwell_s') or 0.0), pname, old))
         _G['cool_since'] = None
         return None
     # ---- ★阶梯加深(2026-10-19): 已经在严重档而温度还压在墙上 -> 每 step_dwell_s 深一级
