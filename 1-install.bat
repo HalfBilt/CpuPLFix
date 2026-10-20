@@ -8,17 +8,20 @@ echo Requesting administrator privileges...
 powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
 exit /b
 :run
-if not exist "%~dp0runtime\python.exe" (
-  if exist "%~dp0runtime.zip" (
+if not exist "%~dp0..\runtime\python.exe" (
+  if exist "%~dp0..\runtime.zip" (
     echo Expanding bundled Python runtime, please wait...
-    tar -xf "%~dp0runtime.zip" -C "%~dp0"
+    tar -xf "%~dp0..\runtime.zip" -C "%~dp0..\"
   )
 )
-if not exist "%~dp0runtime\python.exe" (
-  echo [X] runtime not found. Make sure runtime.zip is in this folder.
+if not exist "%~dp0..\runtime\python.exe" (
+  echo [X] runtime not found.
+echo     Expected: ..untime\python.exe  (shared runtime for both services)
+echo     Fix: copy a Python 3.13 x64 embeddable runtime to ..untime\ ,
+echo          or restore runtime.zip from git history and extract it there.
   pause
   exit /b 1
 )
-"%~dp0runtime\python.exe" "%~dp0CpuPLFix.py" install
+"%~dp0..\runtime\python.exe" "%~dp0CpuPLFix.py" install
 echo.
 pause

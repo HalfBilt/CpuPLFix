@@ -28,7 +28,7 @@ if not exist "%DST%\CpuPLFix.py" (
   pause
   exit /b 1
 )
-if not exist "%DST%\runtime\python.exe" (
+if not exist "%DST%\..\runtime\python.exe" (
   echo   [X] runtime\python.exe missing - run 1-install.bat first.
   echo.
   pause

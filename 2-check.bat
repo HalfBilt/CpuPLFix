@@ -8,11 +8,11 @@ echo Requesting administrator privileges...
 powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
 exit /b
 :run
-if not exist "%~dp0runtime\python.exe" (
-  echo [X] runtime not found. Please run 1-install.bat first.
+if not exist "%~dp0..\runtime\python.exe" (
+  echo [X] runtime not found - run 1-install.bat first.
   pause
   exit /b 1
 )
-"%~dp0runtime\python.exe" "%~dp0CpuPLFix.py" check
+"%~dp0..\runtime\python.exe" "%~dp0CpuPLFix.py" check
 echo.
 pause
