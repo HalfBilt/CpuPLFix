@@ -1,21 +1,13 @@
 # -*- coding: utf-8 -*-
-"""CpuPLFix 命令行配置工具 —— 只改 config.json, 不碰硬件。
+"""CpuPLFix 配置工具 —— 只改 config.json, 不碰硬件。**只管 CPU 功耗墙/过热保护, 不管风扇。**
 
     CpuPLFixCfg.py             看当前配置
     CpuPLFixCfg.py ac=40,55    改插电 PL1/PL2
-    CpuPLFixCfg.py fan=56,79,5 改风扇曲线边界 + 回差
     CpuPLFixCfg.py hold=45 改固件标志锁存判定秒数（0=关掉这条出口）
-    CpuPLFixCfg.py tpower=on/off 温度→功耗调节器（风扇优先：日常功耗跟着温度走；默认 off）
-    CpuPLFixCfg.py fanoff      关闭风扇控制（完全不碰风扇，交还 EC 原生曲线；fanon 打开）
-    CpuPLFixCfg.py dwell=60 降温降档最短驻留秒数（0=关）
+    CpuPLFixCfg.py tpower=on/off 温度→功耗调节器（日常功耗跟着温度走；默认 off）
     CpuPLFixCfg.py flag_pl=20,28 标志置位但温度正常时的 PL1,PL2（默认=预警档，不砍到 10W）
     CpuPLFixCfg.py gmin=30 保护最短驻留秒数 / rel=10 解除驻留秒数
-    CpuPLFixCfg.py boost=70,10,64 负载前馈：占用>=70% 满 10 秒 -> 至少满速
-    CpuPLFixCfg.py boost_hold=30 负载落下后再吹 30 秒
-    CpuPLFixCfg.py fgap=10 非紧急风扇写入的最小间隔（只压降档，秒）
-    CpuPLFixCfg.py fan_dts=92 DTS 前馈：核心温度到 92°C 立刻拉满风扇
     CpuPLFixCfg.py flag_slow=120 凉机时固件标志读的间隔（秒）
-    CpuPLFixCfg.py cool_tail=30 退出过热保护后继续满速 30 秒
     CpuPLFixCfg.py flag_rel=95,60 标志挂着但温度连续 ≤95°C 满 60 秒就自动放开
     CpuPLFixCfg.py warn_pl2=40 预警档只收 PL2 到 40W（PL1 不动）
     CpuPLFixCfg.py crit_hold=10 严重档驻留 10 秒（压不下来才算数）
@@ -26,6 +18,7 @@
     CpuPLFixCfg.py undo        撤销上一次保存
     CpuPLFixCfg.py raw         打印完整 JSON
 
+风扇不在这里改 —— 用 T14scontrol\\fan 里的 FanControl。
 保存后由看守服务在 60 秒内自动重读, 不用重启、不用管理员。
 """
 import io
@@ -37,13 +30,6 @@ import sys
 BASE = os.path.dirname(os.path.abspath(__file__))
 CFG = os.path.join(BASE, 'config.json')
 BAK = CFG + '.bak'
-
-# ★2026-10-19: 6 档从抄错的 3490 改成实测 3880(和 CpuPLFix.FAN_LEVEL_RPM 对齐)。
-#   1~5/7 档仍是抄来的旧值、本机未标定 —— 只影响显示, 不影响控制。
-# ★2026-10-20 全档位实测标定(scripts/风扇档位-20261020-073014.txt)。
-#   ★0x40 不是"真满速": 无负载只给 4160, 比 7 档(4388)还低; 高负载(85°C+)才 ~4900。
-FAN_RPM = {1: 2463, 2: 2865, 3: 3186, 4: 3160, 5: 3456, 6: 3861, 7: 4388, 64: 4900}
-
 
 # ---------------------------------------------------------------- 读写
 def load(path=CFG):
@@ -78,22 +64,6 @@ def save(cfg):
 
 
 # ---------------------------------------------------------------- 显示
-def fan_desc(cfg):
-    f = cfg['fan']
-    curve, hyst = f['curve'], f['hyst']
-    parts = []
-    for i, (hi, lv) in enumerate(curve):
-        lo = 0 if i == 0 else curve[i - 1][0]
-        lvname = '满速' if lv >= 64 else ('%d档' % lv)
-        if i == 0:
-            parts.append('<=%dC %s' % (hi - 1, lvname))
-        elif i == len(curve) - 1:
-            parts.append('>=%dC %s' % (lo, lvname))
-        else:
-            parts.append('%d~%dC %s' % (lo, hi - 1, lvname))
-    return ' | '.join(parts) + ' | 回差 %g' % hyst
-
-
 def show(cfg):
     g = cfg['guard']
     onoff = lambda b: '开' if b else '关'
@@ -116,26 +86,7 @@ def show(cfg):
     print('  flag_slow=%g       凉机(EC < flag_hot)时标志读的间隔（秒，少打扰 EC）'
           % cfg.get('flag_poll_slow_s', 120.0))
     print()
-    print('【风扇】%s' % fan_desc(cfg))
-    print('  fan=56,79,5      段边界 + 回差（按你机器的段数给边界）')
-    print('  lv=%s           每段档位（1~7，64=满速）'
-          % ','.join(str(r[1]) for r in cfg['fan']['curve']))
-    print('  mode=%s        curve / max / level / ec' % cfg['fan']['mode'])
-    print('  level=%s           mode=level 时用' % cfg['fan']['level'])
-    print('  hyst=%g            降档回差（C）' % cfg['fan']['hyst'])
-    print('  fanon/fanoff=%s   风扇总开关：off = 完全不碰风扇，全交给 EC 原生曲线'
-          % onoff(f.get('enabled', True)))
-    print('  dwell=%g           降温降档最短驻留（秒，0=关）'
-          % cfg['fan'].get('min_dwell_s', 60.0))
-    print('  boost=%g,%g,%g      负载前馈：占用>=x%% 满 y 秒 -> 至少 z 档（64=满速；x=0 关）'
-          % (cfg['fan'].get('load_boost_pct', 70.0), cfg['fan'].get('load_boost_s', 10.0),
-             cfg['fan'].get('load_boost_level', 64)))
-    print('  boost_hold=%g       负载落下后再吹这么久（秒）'
-          % cfg['fan'].get('load_hold_s', 30.0))
-    print('  fan_dts=%g         DTS(核心温度)到它就立刻拉满（0=关；比 EC 0x78 快）'
-          % cfg['fan'].get('dts_max_c', 92.0))
-    print('  fgap=%g            非紧急风扇写入的最小间隔（只压降档，秒，0=关）'
-          % cfg['fan'].get('min_write_gap_s', 10.0))
+    print('【风扇】不归本工具管 —— 用 T14scontrol\\fan 的 FanControl（本工具不读不写 0x2F）')
     print()
     print('【过热保护】%s' % onoff(g['enabled']))
     print('  guard=%g,%g,%g,%g          预警/严重/逃生/解除（C）'
@@ -144,9 +95,8 @@ def show(cfg):
           % (g['warn_pl1_w'], g['warn_pl2_w'], g['crit_pl1_w'], g['crit_pl2_w']))
     print('  dts=%g             EC 读不到时的 DTS 兜底（C）' % g['dts_crit_c'])
     print('  flag_hot=%g        固件标志加密温度（C）' % g['flag_hot_c'])
-    print('  guard_on=%s  ffmax=%s  trip=%s  hibernate=%s'
-          % (onoff(g['enabled']), onoff(g['force_fan_max']),
-             onoff(g['trip_flags']), onoff(g['escape_hibernate'])))
+    print('  guard_on=%s  trip=%s  hibernate=%s'
+          % (onoff(g['enabled']), onoff(g['trip_flags']), onoff(g['escape_hibernate'])))
     print('  hold=%g            固件标志锁存判定秒数（0=关掉这条出口）'
           ' ★=同时写 flag_rel 的秒数，两者等价'
           % g.get('trip_hold_s', 45.0))
@@ -156,8 +106,7 @@ def show(cfg):
           % (g.get('flag_pl1_w', 20.0), g.get('flag_pl2_w', 28.0)))
     print('  gmin=%g  rel=%g     保护最短驻留 / 解除驻留（秒，防 40W↔10W 来回切）'
           % (g.get('min_hold_s', 30.0), g.get('release_dwell_s', 10.0)))
-    print('  cool_tail=%g       退出保护后继续满速这么久（秒，缓冲功率阶跃）'
-          % g.get('cool_tail_s', 30.0))
+    print('  cool_tail 已移除（风扇分离后由 fan 工具管）')
     print('  严重档三级          %.0f/%.0fW -> %.0f/%.0fW -> %.0f/%.0fW（PBP -> Minimum '
           'Assured Power -> 地板）'
           % (g.get('crit_pl1_w', 28.0), g.get('crit_pl2_w', 35.0),
@@ -226,7 +175,7 @@ def _bool(v, name):
 
 def apply_kv(cfg, key, val):
     k = key.strip().lower()
-    f, g = cfg['fan'], cfg['guard']
+    g = cfg['guard']
 
     if k == 'ac':
         a, b = _nums(val, 2, 'ac')
@@ -254,41 +203,6 @@ def apply_kv(cfg, key, val):
         cfg['poll_s'] = _num(a, 1, 600, '主循环间隔')
         cfg['ec_poll_s'] = _num(b, 2, 600, 'EC 读间隔')
         cfg['flag_poll_s'] = _num(c, 2, 600, '固件标志间隔')
-    elif k in ('fanon', 'fanoff'):
-        # ★2026-10-20: 风扇总开关。off = 完全不碰风扇(不读 0x2F/转速、不写档位),
-        #   全交给 EC 原生曲线; 手动 `fan` 命令仍可用。保护只剩功耗墙。
-        f['enabled'] = (k == 'fanon')
-    elif k == 'fan':
-        xs = [s.strip() for s in str(val).split(',')]
-        n = len(f['curve']) - 1
-        if len(xs) not in (n, n + 1):
-            raise Fail('fan 需要 %d 个边界（可选再加 1 个回差），用逗号分隔' % n)
-        prev = -1
-        for i in range(n):
-            hi = _num(xs[i], 1, 120, '第 %d 段边界' % (i + 1), integer=True)
-            if hi <= prev:
-                raise Fail('fan 的边界必须递增')
-            prev = hi
-            f['curve'][i][0] = hi
-        f['curve'][-1][0] = 999
-        if len(xs) == n + 1:
-            f['hyst'] = _num(xs[n], 0, 30, '回差')
-    elif k == 'lv':
-        xs = _nums(val, len(f['curve']), 'lv')
-        for i, s in enumerate(xs):
-            v = _num(s, 1, 255, '第 %d 段档位' % (i + 1), integer=True)
-            if 7 < v < 64:
-                raise Fail('档位只能是 1~7 或 64（满速）')
-            f['curve'][i][1] = v
-    elif k == 'mode':
-        s = str(val).strip().lower()
-        if s not in ('curve', 'max', 'level', 'ec'):
-            raise Fail('mode 只能是 curve / max / level / ec')
-        f['mode'] = s
-    elif k == 'level':
-        f['level'] = _num(val, 0, 255, 'level', integer=True, allow_zero=True)
-    elif k == 'hyst':
-        f['hyst'] = _num(val, 0, 30, '回差')
     elif k == 'guard':
         xs = _nums(val, 4, 'guard')
         g['warn_c'] = _num(xs[0], 30, 120, '预警温度')
@@ -307,8 +221,6 @@ def apply_kv(cfg, key, val):
         g['flag_hot_c'] = _num(val, 30, 115, 'flag_hot')
     elif k == 'guard_on':
         g['enabled'] = _bool(val, 'guard_on')
-    elif k == 'ffmax':
-        g['force_fan_max'] = _bool(val, 'ffmax')
     elif k == 'trip':
         g['trip_flags'] = _bool(val, 'trip')
     elif k == 'hold':
@@ -322,8 +234,6 @@ def apply_kv(cfg, key, val):
         # ★2026-10-20: 温度→功耗调节器("风扇优先"模型), 默认关。
         # on = 日常功耗跟着温度走(顶档受 ac= 配的 pl1_w 约束), 保护阶梯只在 ≥98°C 接手。
         g['temp_power'] = _bool(val, 'tpower')
-    elif k == 'dwell':
-        f['min_dwell_s'] = _num(val, 0, 600, '降档最短驻留秒数（0=关）', allow_zero=True)
     elif k == 'flag_pl':
         a, b = _nums(val, 2, 'flag_pl')
         g['flag_pl1_w'] = _num(a, 5, 150, '标志档 PL1', allow_zero=True)
@@ -332,17 +242,6 @@ def apply_kv(cfg, key, val):
         g['min_hold_s'] = _num(val, 0, 600, '保护最短驻留秒数（0=关）', allow_zero=True)
     elif k == 'rel':
         g['release_dwell_s'] = _num(val, 0, 600, '解除驻留秒数（0=关）', allow_zero=True)
-    elif k == 'boost':
-        a, b, c = _nums(val, 3, 'boost')
-        f['load_boost_pct'] = _num(a, 0, 100, '前馈占用阈值（0=关）', allow_zero=True)
-        f['load_boost_s'] = _num(b, 0, 600, '前馈持续秒数', allow_zero=True)
-        f['load_boost_level'] = _num(c, 0, 64, '前馈档位', integer=True, allow_zero=True)
-    elif k == 'boost_hold':
-        f['load_hold_s'] = _num(val, 0, 600, '前馈尾巴秒数', allow_zero=True)
-    elif k == 'fan_dts':
-        f['dts_max_c'] = _num(val, 0, 120, 'DTS 前馈阈值（0=关）', allow_zero=True)
-    elif k == 'fgap':
-        f['min_write_gap_s'] = _num(val, 0, 300, '风扇写入最小间隔秒数（0=关）', allow_zero=True)
     elif k == 'flag_slow':
         cfg['flag_poll_slow_s'] = _num(val, 2, 3600, '凉机标志读间隔秒数', allow_zero=True)
     elif k == 'flag_rel':
@@ -364,8 +263,6 @@ def apply_kv(cfg, key, val):
     elif k == 'crit3':
         p = _pair(val, '地板级')
         g['crit3_pl1_w'], g['crit3_pl2_w'] = p
-    elif k == 'cool_tail':
-        g['cool_tail_s'] = _num(val, 0, 600, '保护退出后继续满速秒数（0=关）', allow_zero=True)
     elif k == 'hibernate':
         g['escape_hibernate'] = _bool(val, 'hibernate')
     # ---- 单项简写
@@ -388,7 +285,7 @@ def apply_kv(cfg, key, val):
 
 def check(cfg):
     """整体一致性检查。返回 warning 列表；不合法直接抛 Fail。"""
-    f, g = cfg['fan'], cfg['guard']
+    g = cfg['guard']
     warns = []
     if not (g['recover_c'] < g['warn_c'] < g['crit_c'] <= g['escape_c']):
         raise Fail('温度阈值必须满足 解除 < 预警 < 严重 <= 逃生')
@@ -402,10 +299,6 @@ def check(cfg):
         warns.append('电池档 PL2 低于 PL1，工具会自动抬平')
     if cfg['flag_poll_s'] < cfg['ec_poll_s']:
         warns.append('固件标志读得比 EC 温度还勤，建议 flag_poll 不小于 ec_poll')
-    if f['hyst'] < 2:
-        warns.append('回差小于 2C 时，温度在边界附近几乎必然来回切档')
-    if f['mode'] in ('ec', 'off', 'auto'):
-        warns.append('风扇交还 EC 自动：原生曲线到不了满速')
     if cfg['mmio_mode'] == 'value':
         warns.append('mmio=value 是锁死 MMIO 的老方案，改功耗墙要重启')
     if not cfg['lock_mmio']:

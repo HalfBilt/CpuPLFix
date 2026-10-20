@@ -4,17 +4,18 @@
 覆盖:
   1) guard_apply 的温度线三级阶梯 / 驻留 / 解除 / 分级回升
   2) 固件标志线: 两轮确认 / 读失败不放开 / 97°C 连续 60 秒判锁存 / 98°C 重置
-  3) fan_level_of 的三段曲线与 5°C 回差
+  3) 拆分后本工具**不该再有**任何风扇符号(fan_tick / set_fan / ec_rpm / FAN_LEVEL_RPM …)
   4) poll_plan 的节奏(凉机 120 秒 / 保护期 5-5-15 / 开机 2-5-10)
   5) MSR 0x610 时间窗解码: _tau_s 与 _pl_time 必须一致(SDM: 8 秒 / 5 秒)
   6) merge_flags: 读失败沿用上一轮、complete=False
   7) 3-config 的 hold= 同时写 trip_hold_s 与 flag_release_s
 
 跑法:
-    "%APPDATA%\\CpuPLFix\\runtime\\python.exe" dev\\selftest.py
-默认测【已安装】那份(%APPDATA%\\CpuPLFix\\CpuPLFix.py); 测仓库这份就把
-CPF_DEPLOY=0 设进环境变量, 或者直接改下面 DEP 那行。
+    "T14scontrol\\cpu\\runtime\\python.exe" dev\\selftest.py
+默认测【本文件所在目录的上一级】那份(cpu\\CpuPLFix.py)。
+想测别的副本: 设环境变量 CPF_ROOT=<那个目录>。
 
+2026-10-20 拆分: 风扇整段删除, 第 3 组断言改成"确认这些符号都不存在"。
 2026-10-20 重写: 旧版的断言停留在"6 段风扇曲线 / 10W 地板 / 标志 30 秒"那代,
 14 项一直红着, 等于没有回归保护。现在时间用打桩(time.time)推进, 不真等 60 秒。
 """
@@ -23,10 +24,9 @@ import json
 import os
 import sys
 
-USE_DEPLOY = os.environ.get('CPF_DEPLOY', '1') != '0'
-ROOT = os.path.join(os.environ.get('APPDATA', ''), 'CpuPLFix' if USE_DEPLOY else '_repo')
-if not USE_DEPLOY:
-    ROOT = os.path.join(os.environ.get('APPDATA', ''), '_repo')
+# 2026-10-20: 原来写死 %APPDATA%\CpuPLFix(部署)/_repo(仓库), 拆分后目录变了 ——
+# 默认跟着本文件走, 免得"测的是一份、改的是另一份"。
+ROOT = os.environ.get('CPF_ROOT') or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 spec = importlib.util.spec_from_file_location('cpf', os.path.join(ROOT, 'CpuPLFix.py'))
 cpf = importlib.util.module_from_spec(spec)
@@ -67,10 +67,6 @@ cpf.on_ac = lambda: True
 
 CFG = {
     'pl1_w': 28.0, 'pl2_w': 55.0, 'pl1_w_batt': 20.0, 'pl2_w_batt': 28.0,
-    'fan': {'mode': 'curve', 'level': 0, 'curve': [[56, 2], [79, 6], [999, 64]],
-            'hyst': 5.0, 'min_dwell_s': 60.0, 'load_boost_pct': 70.0,
-            'load_boost_s': 10.0, 'load_boost_level': 64, 'load_hold_s': 30.0,
-            'min_write_gap_s': 10.0, 'dts_max_c': 92.0},
     'guard': {
         'enabled': True, 'warn_c': 95.0, 'crit_c': 98.0, 'escape_c': 105.0,
         'crit_now_c': 100.0, 'crit_hold_s': 10.0, 'step_dwell_s': 15.0,
@@ -236,24 +232,15 @@ m = tick(60, flags=FLAG_OFF, dt=5.0)
 chk('清零 2 轮: 解除锁存', not cpf._G.get('trip_latched') and '清零' in (m or ''),
     (m or '')[:40])
 
-# ================================================================ 7. 风扇曲线
-print('=== 7. fan_level_of: 四段曲线 + 5°C 回差 ===')
-# ★2026-10-20 标定后改成 4 段: 2(2865) -> 6(3861) -> 7(4388) -> 满速(高负载 ~4900)
-curve = [[56, 2], [79, 6], [85, 7], [999, 64]]
-hyst = 5.0
-seq = [(40, 2), (55, 2), (56, 6), (70, 6), (78, 6), (79, 7), (82, 7), (84, 7),
-       (85, 64), (90, 64), (84, 64), (81, 64), (80, 64), (79, 7), (78, 7), (75, 7),
-       (74, 7), (73, 6), (60, 6), (52, 6), (51, 6), (50, 2), (40, 2)]
-prev = None
-bad = []
-for t, want in seq:
-    lv, idx = cpf.fan_level_of(t, curve, prev, hyst)
-    prev = idx
-    if lv != want:
-        bad.append('%d°C 期望 %s 得到 %s' % (t, want, lv))
-chk('23 个温度点全部符合(含两处回差)', not bad, '; '.join(bad[:3]))
-chk('7 档转速高于 0x40 无负载转速(标定结论)',
-    cpf.FAN_LEVEL_RPM[7] > 4160, '7 档=%d' % cpf.FAN_LEVEL_RPM[7])
+# ================================================================ 7. 拆分后没有风扇代码
+print('=== 7. 拆分后: 本工具不含任何风扇控制符号 ===')
+for _name in ('fan_level_of', 'fan_tick', 'set_fan', 'ec_hfsp', 'ec_rpm',
+              'FAN_LEVEL_RPM', 'FAN_MAX', 'EC_HFSP', 'EC_RPM_LO', 'cmd_fan',
+              'cool_tail_active'):
+    chk('没有 %s' % _name, not hasattr(cpf, _name))
+chk('DEFAULT_CFG 没有 fan 段', 'fan' not in cpf.DEFAULT_CFG)
+chk('guard 没有 force_fan_max', 'force_fan_max' not in cpf.DEFAULT_CFG['guard'])
+chk('guard 没有 cool_tail_s', 'cool_tail_s' not in cpf.DEFAULT_CFG['guard'])
 
 # ================================================================ 8. 节奏
 print('=== 8. poll_plan: 凉机 120 / 保护期 5-5-15 / 开机 2-5-10 ===')

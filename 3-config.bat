@@ -5,11 +5,11 @@ chcp 65001 >nul
 set PYTHONIOENCODING=utf-8
 
 rem Prefer the runtime next to this script (that is the deployed copy). The git repo
-rem only ships runtime.zip, so fall back to the installed copy under %APPDATA%\CpuPLFix.
+rem only ships runtime.zip, so fall back to the installed copy under %APPDATA%\T14scontrol\cpu.
 set PYBIN=%~dp0runtime\python.exe
 set CFGPY=%~dp0CpuPLFixCfg.py
-if not exist "%PYBIN%" set PYBIN=%APPDATA%\CpuPLFix\runtime\python.exe
-if not exist "%CFGPY%" set CFGPY=%APPDATA%\CpuPLFix\CpuPLFixCfg.py
+if not exist "%PYBIN%" set PYBIN=%APPDATA%\T14scontrol\cpu\runtime\python.exe
+if not exist "%CFGPY%" set CFGPY=%APPDATA%\T14scontrol\cpu\CpuPLFixCfg.py
 
 if not exist "%PYBIN%" (
   echo [X] runtime\python.exe not found - run 1-install.bat first.

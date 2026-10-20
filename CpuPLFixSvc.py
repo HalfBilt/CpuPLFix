@@ -34,7 +34,7 @@ cpf = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(cpf)
 
 SERVICE_NAME = 'CpuPLFixSvc'
-SERVICE_DISPLAY = 'CpuPLFix 功耗墙/风扇看守'
+SERVICE_DISPLAY = 'CpuPLFix 功耗墙/过热保护'
 
 SERVICE_WIN32_OWN_PROCESS = 0x00000010
 SERVICE_START_PENDING = 2
@@ -161,10 +161,9 @@ def _worker():
 
     cfg = cpf.load_cfg()
     _log('[*] 服务就绪: 进程启动于系统运行 %.1f 秒, 驱动就绪于 %.1f 秒 (耗时 %.1f 秒), '
-         '目标 PL1=%.1fW PL2=%.1fW, 风扇模式=%s, 过热保护=%s'
+         '目标 PL1=%.1fW PL2=%.1fW, 过热保护=%s (风扇不归本服务管)'
          % (t_entry, cpf.uptime(), cpf.uptime() - t_entry,
             float(cfg['pl1_w'] or 0), float(cfg['pl2_w'] or 0),
-            (cfg.get('fan') or {}).get('mode', cpf.DEFAULT_CFG['fan']['mode']),
             '开' if (cfg.get('guard') or {}).get('enabled', True) else '关'))
     poll_i, ec_i, fl_i = cpf.poll_plan(cfg)
     _log('[*] 已订阅电源事件(SERVICE_ACCEPT_POWEREVENT): 睡眠/休眠恢复后 1 秒内响应')
