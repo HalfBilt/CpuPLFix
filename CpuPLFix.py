@@ -1579,6 +1579,11 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
         # EC 读不到时才拿 CPU DTS 兜底。本机 DTS(MSR 0x1B1) 满载时读数会乱走,
         # 不能跟 EC 并列当触发条件 —— 否则会"压 10W -> 下一轮读回正常 -> 解除"地来回抖。
         lv = 'crit'
+    # ★2026-10-20 审计修复: why 之前只在"阶梯加深"块(lv in ('crit','trip'))里持久化,
+    #   warn 档一律丢失 -> 预警日志永远走 "EC xx°C >= 95°C" 模板, 于是 DTS 快通道
+    #   触发时打成 "EC 71°C >= 95°C"(71 < 95) 这种自相矛盾的话。这里对所有档位统一持久化。
+    if why and lv is not None:
+        _G['why'] = why
     if lv is None:
         # ★2026-10-19: flag 档只走两条出口 —— ① 45 秒锁存判定 ② 连续两轮确认清零。
         #   绝不能走下面这条"温度恢复就放开": flag 档本来就是在凉机上压的, 一进来就满足

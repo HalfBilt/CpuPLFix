@@ -94,6 +94,8 @@ def show(cfg):
     print('  pl_guard=%g,%g,%g,%g        预警 PL1,PL2 / 严重 PL1,PL2（W）'
           % (g['warn_pl1_w'], g['warn_pl2_w'], g['crit_pl1_w'], g['crit_pl2_w']))
     print('  dts=%g             EC 读不到时的 DTS 兜底（C）' % g['dts_crit_c'])
+    print('  dts_warn=%g         DTS 快通道：EC 还没到预警线就先收 PL2（C，0=关）'
+          % (g.get('dts_warn_c') or 0.0))
     print('  flag_hot=%g        固件标志加密温度（C）' % g['flag_hot_c'])
     print('  guard_on=%s  trip=%s  hibernate=%s'
           % (onoff(g['enabled']), onoff(g['trip_flags']), onoff(g['escape_hibernate'])))
@@ -217,6 +219,8 @@ def apply_kv(cfg, key, val):
         g['crit_pl2_w'] = _num(xs[3], 4, 150, '严重 PL2')
     elif k == 'dts':
         g['dts_crit_c'] = _num(val, 40, 125, 'dts')
+    elif k == 'dts_warn':
+        g['dts_warn_c'] = _num(val, 0, 125, 'dts_warn', allow_zero=True)
     elif k == 'flag_hot':
         g['flag_hot_c'] = _num(val, 30, 115, 'flag_hot')
     elif k == 'guard_on':
