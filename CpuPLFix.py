@@ -917,7 +917,10 @@ def _mx_handle(slot, name):
     return h
 
 
-def _ec_lock(timeout_ms=3000):
+EC_LOCK_TIMEOUT_MS = 3000      # 默认等锁上限; 风扇进程会调小(它绝不能为此卡住循环)
+
+
+def _ec_lock(timeout_ms=None):
     """把 EC 端口事务跨进程串行化(看守服务 / 命令行 / 扫描工具都用这一把 + 对家那把)。
 
     实测教训: 两个进程同时做那套"写命令 0x80 -> 写偏移 -> 读数据"的四步事务时, 双方会
@@ -1028,7 +1031,7 @@ def ec_read_ok(off, tries=3):
     """
     prev = None
     delays = EC_RETRY_DELAYS
-    for i in range(max(2, tries)):
+    for i in range(max(1, tries)):
         v = ec_read(off, delay=delays[min(i, len(delays) - 1)])
         if v is not None and prev is not None and v == prev:
             return v
