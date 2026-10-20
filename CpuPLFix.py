@@ -2523,30 +2523,57 @@ def on_ac():
 
 
 def print_version_check(out):
-    """部署漂移检查: 现在跑的 CpuPLFix.py 与工具仓库 %APPDATA%\\_repo 里那份是不是同一份。
+    """单一目录模式(2026-10-20 合并后): 检查"磁盘代码 vs 正在跑的代码"。
 
-    2026-10-19 踩过: 跑着的代码不是磁盘上的代码(别的 agent 打了补丁又整体回滚),
-    排查时白绕了一大圈。以后 2-check 第一屏就有这一行。
+    以前比 %APPDATA%/_repo/CpuPLFix.py 的 SHA256 —— 合并后两者是同一个文件, 比哈希
+    永远一致、等于没检查。现在改成两条更有用的:
+      ① git 有没有未提交改动(改了没提交 = 别的 agent 动过 / 自己忘了提交);
+      ② CpuPLFix.py 的 mtime 是否晚于最后一次"服务就绪" —— 晚了说明服务还在跑旧代码。
     """
     import hashlib
-
-    def h(p):
-        try:
-            with open(p, 'rb') as f:
-                return hashlib.sha256(f.read()).hexdigest()[:12]
-        except Exception:
-            return None
+    import re
+    import subprocess
 
     me = os.path.abspath(__file__)
-    repo = os.path.join(os.path.dirname(os.path.dirname(me)), '_repo', 'CpuPLFix.py')
-    a, b = h(me), h(repo)
-    if b is None:
-        out('版本一致性       : %s (仓库 %s 不在, 不做对比)' % (a, repo))
-    elif a == b:
-        out('版本一致性       : [√] 与 _repo 一致 (%s)' % a)
-    else:
-        out('版本一致性       : [!] 与 _repo 不一致 (%s vs %s) —— 跑的这份不是仓库里那份'
-            % (a, b))
+    d = os.path.dirname(me)
+    try:
+        sha = hashlib.sha256(open(me, 'rb').read()).hexdigest()[:12]
+    except Exception:
+        sha = '?'
+
+    git_state = ''
+    try:
+        r = subprocess.run(['git', '-C', d, 'status', '--porcelain', 'CpuPLFix.py'],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           timeout=5, creationflags=0x08000000)
+        if r.returncode == 0:
+            git_state = '有未提交改动' if r.stdout.strip() else '干净'
+    except Exception:
+        pass
+
+    stale = ''
+    try:
+        mt = os.path.getmtime(me)
+        logp = os.path.join(d, 'logs', 'fix.log')
+        last = None
+        cur = None
+        with open(logp, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                m = re.match(r'===== (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ', line)
+                if m:
+                    cur = m.group(1)
+                elif '服务就绪' in line and cur:
+                    last = cur
+        if last:
+            lt = time.mktime(time.strptime(last, '%Y-%m-%d %H:%M:%S'))
+            if mt > lt + 5:
+                stale = ('  [!] 文件比服务启动晚 %.0f 分钟 —— 服务可能还在跑旧代码, '
+                         '跑一次 部署并重启.bat' % ((mt - lt) / 60.0))
+    except Exception:
+        pass
+
+    out('版本一致性       : %s (git %s)%s'
+        % (sha, git_state or '?', stale))
 
 
 def battery_flags():
