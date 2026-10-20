@@ -1973,7 +1973,12 @@ def poll_plan(cfg, fast=False, guard=False, hot=False, jump=False):
     if jump:
         ec, fl = min(ec, EC_JUMP_RETRY_S), min(fl, EC_JUMP_RETRY_S)
     if guard:
-        ec = min(ec, poll)
+        # ★2026-10-20 修: 原来 ec = min(ec, poll)。poll 从 5 秒改成 2 秒(DTS 快通道需要 2 秒
+        #   一拍)之后, 这句把**保护期间的 EC 温度读也从 5 秒压到 2 秒**, EC 事务量翻 2.5 倍
+        #   (实测 110 笔/分, 其中 ~90 笔来自 ec_temp 的 哨兵+目标+哨兵 三次读)。
+        #   而"保护中要读得勤"这个需求已经被 DTS 快通道(MSR, 不占 EC)完全覆盖了 ——
+        #   EC 只需要 5 秒一次给阶梯/解除判定用。所以给一个 5 秒地板。
+        ec = min(ec, max(poll, 5.0))
         # ★2026-10-19: 标志是"锁存位", 保护期间没必要跟主循环同频 —— 每次最多 9 次 EC 事务,
         #   而工程机读失败率 15~26%, 读得越勤越容易把"读不到"变成"标志没了"(见 merge_flags)。
         #   温度线仍跟主循环(5 秒), 标志降到 15 秒。
