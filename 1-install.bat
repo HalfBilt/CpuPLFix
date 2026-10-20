@@ -1,4 +1,8 @@
 @echo off
+rem ---- console codepage adaptive: keep Python output readable ----
+for /f "tokens=2 delims=: " %%c in ('chcp') do set "CP=%%c"
+if "%CP%"=="936" set "PYTHONIOENCODING=gbk"
+if "%CP%"=="65001" set "PYTHONIOENCODING=utf-8"
 cd /d "%~dp0"
 if "%CPF_ELEV%"=="1" goto run
 fltmc >nul 2>&1
@@ -8,12 +12,6 @@ echo Requesting administrator privileges...
 powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
 exit /b
 :run
-if not exist "%~dp0..\runtime\python.exe" (
-  if exist "%~dp0..\runtime.zip" (
-    echo Expanding bundled Python runtime, please wait...
-    tar -xf "%~dp0..\runtime.zip" -C "%~dp0..\"
-  )
-)
 if not exist "%~dp0..\runtime\python.exe" (
   echo [X] runtime not found.
 echo     Expected: ..untime\python.exe  (shared runtime for both services)

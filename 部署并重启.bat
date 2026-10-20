@@ -1,4 +1,8 @@
 @echo off
+rem ---- console codepage adaptive: keep Python output readable ----
+for /f "tokens=2 delims=: " %%c in ('chcp') do set "CP=%%c"
+if "%CP%"=="936" set "PYTHONIOENCODING=gbk"
+if "%CP%"=="65001" set "PYTHONIOENCODING=utf-8"
 cd /d "%~dp0"
 if "%CPF_ELEV%"=="1" goto run
 fltmc >nul 2>&1
@@ -8,13 +12,12 @@ echo Requesting administrator privileges...
 powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
 exit /b
 :run
-chcp 65001 >nul
 title CpuPLFix restart
 
 rem ============================================================
-rem  2026-10-20 èµ·: æœ¬ç›®å½•æ—¢æ˜¯"å®‰è£…ç›®å½•"ä¹Ÿæ˜¯"æºç ä»“åº“"ã€‚
-rem  æ”¹å®Œ CpuPLFix.py ä¸ç”¨å†å¤åˆ¶ â€”â€” è¿™ä¸ªè„šæœ¬åªåš"æ¸…ç¼“å­˜ + é‡å¯æœåŠ¡"ã€‚
-rem  (ä»¥å‰è¦è·‘ _repo é‡Œçš„åŒåè„šæœ¬, çŽ°åœ¨ _repo å·²åˆå¹¶è¿›æ¥)
+rem  2026-10-20 Æð: ±¾Ä¿Â¼¼ÈÊÇ"°²×°Ä¿Â¼"Ò²ÊÇ"Ô´Âë²Ö¿â"¡£
+rem  ¸ÄÍê CpuPLFix.py ²»ÓÃÔÙ¸´ÖÆ ¡ª¡ª Õâ¸ö½Å±¾Ö»×ö"Çå»º´æ + ÖØÆô·þÎñ"¡£
+rem  (ÒÔÇ°ÒªÅÜ _repo ÀïµÄÍ¬Ãû½Å±¾, ÏÖÔÚ _repo ÒÑºÏ²¢½øÀ´)
 rem ============================================================
 
 set "DST=%~dp0"
@@ -53,6 +56,6 @@ echo ---------------- log tail (last 14 lines) ----------------
 powershell -NoProfile -Command "Get-Content -Encoding UTF8 -Tail 14 '%LOG%'"
 echo ----------------------------------------------------------
 echo.
-echo Done. æ–°ä»£ç è¦ç­‰æ—¥å¿—é‡Œå‡ºçŽ° "æœåŠ¡å°±ç»ª" æ‰ç®—ç”Ÿæ•ˆã€‚
+echo Done. ÐÂ´úÂëÒªµÈÈÕÖ¾Àï³öÏÖ "·þÎñ¾ÍÐ÷" ²ÅËãÉúÐ§¡£
 echo.
 pause
