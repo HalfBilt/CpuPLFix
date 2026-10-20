@@ -1722,9 +1722,22 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
                    g['crit_pl1_w'], hold, g['warn_c'], g['crit_c']))
     p1w = float(g.get('warn_pl1_w') or 0.0) or float(profile_pl(cfg)[0] or 0.0) or 40.0
     set_pl_override(p1w, float(g.get('warn_pl2_w') or 40.0))
+    # ★2026-10-20: 预警可能由**两条不同的路**触发, 文案必须说清是哪条:
+    #   ① 温度线: EC >= warn_c(95°C)
+    #   ② DTS 快通道: EC 还没到 95°C, 但 DTS >= dts_warn_c(90°C) 连高两拍 -> 先收 PL2
+    #      (EC 0x78 滞后 15~20 秒, 等它到 95°C 就晚了)
+    #   旧文案一律写"EC xx°C >= 95°C", DTS 触发时会写成"EC 71°C >= 95°C" —— 自相矛盾,
+    #   后来看日志会被带偏(实测 14:23:03 就是这种)。
+    _why = _G.get('why') or ''
+    if _why.startswith('DTS'):
+        return ('过热保护[预警·DTS快通道]: DTS %d°C ≥ %.0f°C 连高两拍, 而 EC 才 %d°C(还没到 %.0f°C, '
+                '但 EC 0x78 滞后 15~20 秒) —— 先把 PL2 收到 %.0fW(PL1 仍 %.0fW, 保瞬时性能)'
+                % (dts if dts is not None else -1, _gv(g, 'dts_warn_c', 90.0),
+                   et if et is not None else -1, g['warn_c'],
+                   _gv(g, 'warn_pl2_w', 40.0), p1w))
     return ('过热保护[预警]: EC %d°C ≥ %.0f°C%s —— 只把 PL2 收到 %.0fW(PL1 仍 %.0fW, 保瞬时性能); '
             '持续 %.0f 秒还这么高才进"严重"'
-            % (et, g['warn_c'], (' (%s)' % _G['why']) if _G.get('why') else '',
+            % (et, g['warn_c'], (' (%s)' % _why) if _why else '',
                _gv(g, 'warn_pl2_w', 40.0), p1w, _gv(g, 'crit_hold_s', 10.0)))
 
 
