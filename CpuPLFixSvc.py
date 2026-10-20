@@ -18,6 +18,7 @@
     pythonw.exe CpuPLFixSvc.py --service
 """
 import ctypes
+import json
 import os
 import sys
 import threading
@@ -32,6 +33,32 @@ import importlib.util
 _spec = importlib.util.spec_from_file_location('cpf', os.path.join(BASE, 'CpuPLFix.py'))
 cpf = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(cpf)
+
+STATUS_DIR = os.path.join(os.path.dirname(BASE), 'status')
+
+
+def _pub_status():
+    """给任务栏 HUD 用的状态快照（原子写；任何异常都不影响主循环）。"""
+    try:
+        v = cpf.rdmsr(0x198) or 0
+        t = cpf.rdmsr(0x1B1)
+        pl = cpf.decode_pl(cpf.rdmsr(cpf.MSR_PKG_POWER_LIMIT) or 0)
+        obj = {
+            'ts': round(time.time(), 2),
+            'freq_mhz': ((v >> 8) & 0xFF) * 100,   # 0x198 的 15:8 位是倍频(100MHz/档)
+            'ec': cpf.last_ec_temp(),
+            'dts': (100 - ((t >> 16) & 0x7F)) if t else None,
+            'level': cpf.guard_level(),
+            'pl1': round(pl['pl1_w'], 1),
+            'pl2': round(pl['pl2_w'], 1),
+        }
+        os.makedirs(STATUS_DIR, exist_ok=True)
+        tmp = os.path.join(STATUS_DIR, 'cpu.json.tmp')
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(obj, fh, ensure_ascii=False)
+        os.replace(tmp, os.path.join(STATUS_DIR, 'cpu.json'))
+    except Exception:
+        pass
 
 SERVICE_NAME = 'CpuPLFixSvc'
 SERVICE_DISPLAY = 'CpuPLFix 功耗墙/过热保护'
@@ -207,6 +234,8 @@ def _worker():
             _log('[*] 检查异常: %s' % e)
             _log(traceback.format_exc())
             cpf.flush_log('svc')
+
+        _pub_status()
 
         woke = _wake.wait(poll_i)
         if _stop.is_set():
