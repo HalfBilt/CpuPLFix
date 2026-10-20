@@ -116,6 +116,8 @@ DEFAULT_CFG = {
         "ramp_step_s": 30.0,        # ★解除后逐级回升, 每级这么多秒
         "ramp_pls": [[20.0, 25.0], [28.0, 35.0]],   # ★回升阶梯(末尾自动接回原档)
         "dts_crit_c": 97.0,     # CPU DTS 单独触发"严重"档(仅 EC 温度读不到时兜底)
+        "dts_warn_c": 90.0,     # ★2026-10-20: DTS 快通道 —— EC 滞后 15~20 秒,
+                                #   DTS 一碰它就先把 PL2 收到 40W(55W 的爆发留给前 ~10 秒)
         "flag_hot_c": 85.0,     # EC 温度到它就恢复"每次 EC 轮询都读固件标志"(平时 30 秒一次)
         "trip_flags": True,     # EC 0x89/0x8A/0x8B 一置位就是最高级(固件真判据)
         # ★2026-10-19: 标志置位**不等于现在热** —— 实测 11:04 时 0x89=0x01 而 EC 58°C/
@@ -974,7 +976,18 @@ def ec_read(off, _locked=False, delay=0.003):
     #   事务级、也没覆盖真正喂风扇曲线的那几笔。现在按**事务**计数, 分母才稳。
     _ECBUS['tx'] = _ECBUS.get('tx', 0) + 1
     try:
-        _ec_drain()
+        # ★2026-10-20(12:31:49 凉机强制休眠): 不再无条件 _ec_drain()。
+        #   输出缓冲里挂着的字节多半是**系统 ACPI EC 驱动(_TMP)正在等**的数据;
+        #   我们读走它 -> 对方超时(系统日志 ACPI 事件 13) -> DSDT 的 _TMP 拿到失败值
+        #   -> 固件报 _HOT -> 强制休眠。当天 12:31:47 事件 13、12:31:49 事件 88,
+        #   而 EC 只有 58°C —— 所以宁可这一轮判"没读到"(沿用上一次的值), 也不抢。
+        st = rd_port(EC_CTRL)
+        if st is not None and (st & 0x01):
+            if _ECBUS.get('obf_busy', 0) < 2:
+                _ECBUS['obf_busy'] = _ECBUS.get('obf_busy', 0) + 1
+                return _ec_fail()
+            _ec_drain()                   # 连续 5 次 -> 只可能是我们自己上次留下的
+        _ECBUS['obf_busy'] = 0
         if not _ec_wait(True):
             return _ec_fail()
         if not wr_port(EC_CTRL, 0x80):      # ★2026-10-19: 原来丢掉返回值 —— 写失败也照样往下走
@@ -1520,6 +1533,12 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
     elif _G.get('crit_since') is None:
         _G['crit_since'] = now
 
+    # ★2026-10-20 新增: DTS 快通道。要**连续两拍**(2 秒一拍 = 4 秒)都高才动手 ——
+    #   凉机上单核睿频的 DTS 尖峰也能到 86℃, 单拍就触发会把 PL2 白压 40 秒。
+    dts_hi = (et is not None and dts is not None
+              and dts >= _gv(g, 'dts_warn_c', 90.0) and et < g['warn_c'])
+    prev_hi = bool(_G.get('dts_hi'))
+    _G['dts_hi'] = dts_hi
     lv = None
     why = ''
     if hit and _G.get('trip_hits', 0) >= 2:
@@ -1533,6 +1552,13 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
                or (dts is not None and dts >= g.get('dts_crit_c', 97.0)))
         lv = 'trip' if hot else 'flag'
         why = '固件标志'
+    elif dts_hi and prev_hi:
+        # ★2026-10-20(DTS 快通道): EC 0x78 滞后 15~20 秒, 而 PL2=55W 从 82°C 冲到 100°C
+        #   只要 20 秒 —— 等 EC 到 95°C 再动手就晚了(实测 12:09:18 核心已 100°C,
+        #   12:09:33 服务才把 PL2 收到 40W)。DTS(MSR 0x1B1) 每 2 秒就有新值, 用它提前收:
+        #   55W 仍然给足前 ~10 秒(开程序/编译一个文件都在这一段), DTS 连高 4 秒就降到 40W
+        #   (40W 的平衡温度是 92°C, 实测无降频)。EC 自己也到 warn_c 时走下面的温度分档。
+        lv, why = 'warn', 'DTS %.0f°C' % dts
     elif et is not None:                # 读不到 EC 温度就不按温度动, 免得误判
         if et >= g['escape_c']:
             lv, why = 'crit3', '逃生(≥%.0f°C)' % g['escape_c']
