@@ -35,16 +35,23 @@ cpf = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(cpf)
 
 STATUS_DIR = os.path.join(os.path.dirname(BASE), 'status')
+PUB_MIN_GAP_S = 10.0     # 状态文件最短重写间隔(秒)
+
+
+_pub_last = {'data': None, 't': 0.0}
 
 
 def _pub_status():
-    """给任务栏 HUD 用的状态快照（原子写；任何异常都不影响主循环）。"""
+    """给任务栏 HUD 用的状态快照（原子写；任何异常都不影响主循环）。
+
+    ★节流: 数值没变且距上次写不足 PUB_MIN_GAP_S 秒就跳过 —— 空闲时别每 2 秒写盘。
+      HUD 的过期门限是 15 秒, 这里 10 秒心跳足够。
+    """
     try:
         v = cpf.rdmsr(0x198) or 0
         t = cpf.rdmsr(0x1B1)
         pl = cpf.decode_pl(cpf.rdmsr(cpf.MSR_PKG_POWER_LIMIT) or 0)
         obj = {
-            'ts': round(time.time(), 2),
             'freq_mhz': ((v >> 8) & 0xFF) * 100,   # 0x198 的 15:8 位是倍频(100MHz/档)
             'ec': cpf.last_ec_temp(),
             'dts': (100 - ((t >> 16) & 0x7F)) if t else None,
@@ -52,6 +59,12 @@ def _pub_status():
             'pl1': round(pl['pl1_w'], 1),
             'pl2': round(pl['pl2_w'], 1),
         }
+        now = time.time()
+        if obj == _pub_last['data'] and (now - _pub_last['t']) < PUB_MIN_GAP_S:
+            return
+        obj['ts'] = round(now, 2)
+        _pub_last['data'] = {k: v2 for k, v2 in obj.items() if k != 'ts'}
+        _pub_last['t'] = now
         os.makedirs(STATUS_DIR, exist_ok=True)
         tmp = os.path.join(STATUS_DIR, 'cpu.json.tmp')
         with open(tmp, 'w', encoding='utf-8') as fh:
