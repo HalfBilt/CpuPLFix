@@ -9,49 +9,39 @@ powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
 exit /b
 :run
 chcp 65001 >nul
-title CpuPLFix deploy + restart
+title CpuPLFix restart
 
-set "SRC=%~dp0"
-set "DST=%APPDATA%\CpuPLFix"
+rem ============================================================
+rem  2026-10-20 起: 本目录既是"安装目录"也是"源码仓库"。
+rem  改完 CpuPLFix.py 不用再复制 —— 这个脚本只做"清缓存 + 重启服务"。
+rem  (以前要跑 _repo 里的同名脚本, 现在 _repo 已合并进来)
+rem ============================================================
+
+set "DST=%~dp0"
+if "%DST:~-1%"=="\" set "DST=%DST:~0,-1%"
 set "LOG=%DST%\logs\fix.log"
 
-echo [1/4] checking paths ...
-if not exist "%SRC%CpuPLFix.py" (
-  echo   [X] CpuPLFix.py not found next to this bat - run it from the _repo folder.
-  echo.
-  pause
-  exit /b 1
-)
+echo [1/3] checking files ...
 if not exist "%DST%\CpuPLFix.py" (
-  echo   [X] deploy folder "%DST%" has no CpuPLFix.py - install first ^(1-install.bat^).
+  echo   [X] CpuPLFix.py not found in "%DST%"
   echo.
   pause
   exit /b 1
 )
-echo   repo   = %SRC%
-echo   deploy = %DST%
-fc /b "%SRC%CpuPLFix.py" "%DST%\CpuPLFix.py" >nul 2>&1
-if not errorlevel 1 (
-  echo   [i] the two files are already identical
-) else (
-  echo   [i] they differ - the new code will be copied
-)
-
-echo [2/4] copying CpuPLFix.py to the deploy folder ...
-copy /y "%SRC%CpuPLFix.py" "%DST%\CpuPLFix.py" >nul
-if errorlevel 1 (
-  echo   [X] copy failed
+if not exist "%DST%\runtime\python.exe" (
+  echo   [X] runtime\python.exe missing - run 1-install.bat first.
   echo.
   pause
   exit /b 1
 )
-echo   [ok]
+echo   install dir = %DST%
+echo   (this folder is the repo too - no copying needed)
 
-echo [3/4] removing __pycache__ so the new code is really loaded ...
+echo [2/3] clearing __pycache__ ...
 if exist "%DST%\__pycache__" rd /s /q "%DST%\__pycache__"
 echo   [ok]
 
-echo [4/4] restarting service CpuPLFixSvc ...
+echo [3/3] restarting service CpuPLFixSvc ...
 net stop CpuPLFixSvc
 timeout /t 3 /nobreak >nul
 net start CpuPLFixSvc
@@ -63,16 +53,6 @@ echo ---------------- log tail (last 14 lines) ----------------
 powershell -NoProfile -Command "Get-Content -Encoding UTF8 -Tail 14 '%LOG%'"
 echo ----------------------------------------------------------
 echo.
-echo Done. The next EC report line needs about 5-6 minutes.
-echo How to confirm THIS build is live (the wait value no longer tells you):
-echo   - 2-check prints the fan level label with 3880 RPM (not the old 3490)
-echo   - fan write problems now say either "write failed" or "readback not confirmed"
-echo   - the health line now reads "EC bus: ... N transactions ... collisions ..."
-echo     (new wording; it counts transactions, not read decisions)
-echo   - a NON-admin process can now OPEN the two named mutexes. Check it with:
-echo       %APPDATA%\CpuPLFix\runtime\python.exe %APPDATA%\_repo\CpuPLFix.py lock
-echo     (it must print "can open" for both; NOTE: 2-check itself always needs admin,
-echo      because it opens the TSCtl driver - that is unrelated to the mutex)
-echo   - a new "===== ... svc =====" block appears in fix.log after the restart
+echo Done. 新代码要等日志里出现 "服务就绪" 才算生效。
 echo.
 pause
