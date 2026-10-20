@@ -1031,7 +1031,7 @@ def ec_read_ok(off, tries=3):
     """
     prev = None
     delays = EC_RETRY_DELAYS
-    for i in range(max(1, tries)):
+    for i in range(max(2, tries)):
         v = ec_read(off, delay=delays[min(i, len(delays) - 1)])
         if v is not None and prev is not None and v == prev:
             return v
