@@ -89,6 +89,8 @@ DEFAULT_CFG = {
     # ★凉机(EC < flag_hot_c)且没在保护时, 标志读降到这个间隔 —— 少打扰 EC(EC 端口与系统
     #   ACPI EC 驱动/固件共用, 读得越勤越容易互相插队, 见 03 §4)
     "flag_poll_slow_s": 120.0,
+    # EC 总线体检写不写日志: always / auto(有撞车才写) / off
+    "bus_report": "auto",
     # ---- 过热保护: 防止跑到固件的 _HOT 阈值被强制休眠 ----
     "guard": {
         "enabled": True,
@@ -1192,6 +1194,10 @@ def ec_bus_report():
         return None                       # 限频: 风暴时别刷屏
     _ECBUS['last_report'] = time.time()
     hits = n_hard + n_soft + n_can
+    # 2026-10-21: bus_report 只影响"写不写日志", 统计照旧(2-check 仍能看撞车率)
+    _mode = (_ECBUS.get("mode") or "auto")
+    if _mode == "off" or (_mode == "auto" and hits == 0):
+        return None
     # ★2026-10-19 起即使 0 串位也会出这一行: "0 串位"本身就是"修好了"的证据, 得看得见。
     return ('EC 总线体检: 最近 %d 笔事务 / %.1f 秒 —— 撞车 %d 次(%.1f%%) '
             '[读失败 %d / 值变动 %d / 哨兵不符 %d], 等待 %.1f ms —— '
@@ -1906,6 +1912,7 @@ def tick(cfg=None, ec=True, read_flags=True):
     read_flags=False 本轮不读固件过热标志(缓存值只当显示用, 不当新证据 —— 见 guard_apply)。
     """
     cfg = cfg if cfg is not None else load_cfg()
+    _ECBUS["mode"] = str(cfg.get("bus_report") or "auto").lower()
     notes = []
     if not ensure_driver(verbose=False):
         return notes
