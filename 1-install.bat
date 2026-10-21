@@ -14,8 +14,8 @@ exit /b
 :run
 if not exist "%~dp0..\runtime\python.exe" (
   echo [X] runtime not found.
-echo     Expected: ..untime\python.exe  (shared runtime for both services)
-echo     Fix: copy a Python 3.13 x64 embeddable runtime to ..untime\ ,
+echo     Expected: ..\runtime\python.exe  (shared runtime for both services)
+echo     Fix: copy a Python 3.13 x64 embeddable runtime to ..\runtime\ ,
 echo          or restore runtime.zip from git history and extract it there.
   pause
   exit /b 1

@@ -111,11 +111,15 @@ DEFAULT_CFG = {
         "crit3_pl1_w": 12.0,        # ★地板(仅 100°C 或持续压不下来时)
         "crit3_pl2_w": 14.0,
         "crit_hold_s": 10.0,        # ★驻留: 持续 >=crit_c 这么久才进"严重"
-        "crit_now_c": 100.0,        # ★单次到它(=TjMax)立即进"严重"
+        "crit_now_c": 99.0,         # ★单次到它立即进"严重"并直接第二级(99°C 只剩 1°C 余量)
+        "crit_floor_c": 100.0,      # ★单次到它(=TjMax)直接下地板 12/14, 不再等 15 秒
         "step_dwell_s": 15.0,       # ★每级停留这么久还压不下来就再深一级
         "ramp_step_s": 30.0,        # ★解除后逐级回升, 每级这么多秒
         "ramp_pls": [[20.0, 25.0], [28.0, 35.0]],   # ★回升阶梯(末尾自动接回原档)
-        "dts_crit_c": 97.0,     # CPU DTS 单独触发"严重"档(仅 EC 温度读不到时兜底)
+        "dts_crit_c": 99.0,     # ★DTS 危险线: 连续两拍 >= 它就至少进第二级(20/25)。
+                                #   不能画在 97: 实测正常 40W 满载 DTS 就 99~100(EC 才 92),
+                                #   97 会把正常满载当失控, 白砍 PL1 到 20W
+        "dts_hot_now_c": 100.0, # ★单拍 >= 它(=TjMax)立即进第二级(EC 到 100 另有地板线)
         "dts_warn_c": 90.0,     # ★2026-10-20: DTS 快通道 —— EC 滞后 15~20 秒,
                                 #   DTS 一碰它就先把 PL2 收到 40W(55W 的爆发留给前 ~10 秒)
         "flag_hot_c": 85.0,     # EC 温度到它就恢复"每次 EC 轮询都读固件标志"(平时 30 秒一次)
@@ -123,7 +127,7 @@ DEFAULT_CFG = {
         # ★2026-10-19: 标志置位**不等于现在热** —— 实测 11:04 时 0x89=0x01 而 EC 58°C/
         #   DTS 62°C/倍频 43(4.3GHz)/占用 10%; 01:03~04:28 那次在 36~51°C 挂了 3 小时。
         #   它是固件"记录过一次过热"的锁存位。所以温度正常时不再砍到 crit(10W):
-        #     flag_pl1_w/flag_pl2_w = 标志置位但温度正常时用的档(默认 = warn 档 20/28W)+风扇满速
+        #     flag_pl1_w/flag_pl2_w = 标志置位但温度正常时用的档(默认 = warn 档 20/28W)
         #     trip_hold_s          = 这么凉还挂着满这么多秒 -> 判"锁存", 放开功耗墙
         #     min_hold_s           = 进入保护后至少撑这么久(防 40W↔10W 十几秒来回切)
         #     release_dwell_s      = 温度要连续 <= recover_c 这么久才真解除
@@ -137,11 +141,12 @@ DEFAULT_CFG = {
         # ★2026-10-19(用户指出后加): 标志档的"温度正常持续一段时间就自动解除"出口。
         #   标志挂着 + 温度连续 <= flag_release_c 达 flag_release_s 秒 -> 判"固件锁存位,
         #   不是真过热" -> 分级回升放开, 并保持放开(标志清零前不再据此降档)。
-        #   ★2026-10-20: flag_release_c 由"预警线 95°C"提到 **97°C**。理由: 本机 28W 满载
-        #   稳态就是 89~95°C, 偶尔触到 96 —— 线画在 95 会让"连续"计时被反复重置, 退回
-        #   "永远压着 20/28W"的老毛病。97 低于 crit_c(98), 真过热仍由温度线接管。
+        #   ★2026-10-21: flag_release_c 从 97 降到 **92°C**。97 只比 crit_c(98) 低 1°C,
+        #   一放开就接回 28/55W, 正好在固件 _HOT 墙边试探; 92 留 6°C 余量, 20/28W 下
+        #   风扇能把它压住。92 仍高于 28W 满载稳态(89~91°C 的常见区间), 不会像 95 那样
+        #   让"连续"计时永远被打断 —— 真压不下来时温度线(95/98)照旧接管。
         #   flag_release_s = 0 表示关掉这条出口(退回"标志不清零就一直压着"的老行为)。
-        "flag_release_c": 97.0,
+        "flag_release_c": 92.0,
         "flag_release_s": 60.0,
         "min_hold_s": 30.0,
         "release_dwell_s": 10.0,
@@ -777,12 +782,36 @@ def _ec_drain():
         time.sleep(0.001)
 
 
-def _ec_wait(clear_obf, timeout=1.0):
+EC_OBF_GIVEUP = 5      # OBF 连续挂这么多轮才认作自己的残留(见 _ec_obf_gate)
+
+
+def _ec_obf_gate():
+    """开始一笔 EC 事务前检查 OBF。
+
+    输出缓冲里有字节时,**绝大多数情况是系统 ACPI EC 驱动(_TMP)正在等的数据**,
+    读走它会让对方超时(事件 13), _TMP 拿到失败值后固件报 _HOT -> 强制休眠(事件 88)。
+    所以前 EC_OBF_GIVEUP-1 轮直接放弃; 只有连续这么多轮都挂着, 才认为是自己上次
+    事务留下的残字节并清掉。读、写两条路径都必须走这里。
+    """
+    st = rd_port(EC_CTRL)
+    if st is not None and (st & 0x01):
+        n = int(_ECBUS.get('obf_busy', 0)) + 1
+        _ECBUS['obf_busy'] = n
+        if n < EC_OBF_GIVEUP:
+            return False
+        _ec_drain()
+    _ECBUS['obf_busy'] = 0
+    return True
+
+
+def _ec_wait(clear_obf, timeout=None):
     """等 EC 就绪: IBF(0x02) 必须为 0; clear_obf=True 时还要求 OBF(0x01) 为 0。
 
     注意: 这里只能等 IBF, 不能等 OBF 置位 —— TSCtl 驱动的端口读会把 OBF 自己吃掉,
     靠 OBF 判断会把每一次读都判成超时(实测踩过)。顺序照抄已验证可用的实现。
     """
+    if timeout is None:
+        timeout = EC_WAIT_TIMEOUT_S
     end = time.time() + timeout
     while time.time() < end:
         st = rd_port(EC_CTRL)
@@ -918,9 +947,12 @@ def _mx_handle(slot, name):
 
 
 EC_LOCK_TIMEOUT_MS = 3000      # 默认等锁上限; 风扇进程会调小(它绝不能为此卡住循环)
+EC_WAIT_TIMEOUT_S = 1.0        # 单个事务阶段的 IBF 等待上限; 风扇进程会调小
 
 
 def _ec_lock(timeout_ms=None):
+    if timeout_ms is None:
+        timeout_ms = EC_LOCK_TIMEOUT_MS
     """把 EC 端口事务跨进程串行化(看守服务 / 命令行 / 扫描工具都用这一把 + 对家那把)。
 
     实测教训: 两个进程同时做那套"写命令 0x80 -> 写偏移 -> 读数据"的四步事务时, 双方会
@@ -984,13 +1016,8 @@ def ec_read(off, _locked=False, delay=0.003):
         #   我们读走它 -> 对方超时(系统日志 ACPI 事件 13) -> DSDT 的 _TMP 拿到失败值
         #   -> 固件报 _HOT -> 强制休眠。当天 12:31:47 事件 13、12:31:49 事件 88,
         #   而 EC 只有 58°C —— 所以宁可这一轮判"没读到"(沿用上一次的值), 也不抢。
-        st = rd_port(EC_CTRL)
-        if st is not None and (st & 0x01):
-            if _ECBUS.get('obf_busy', 0) < 2:
-                _ECBUS['obf_busy'] = _ECBUS.get('obf_busy', 0) + 1
-                return _ec_fail()
-            _ec_drain()                   # 连续 5 次 -> 只可能是我们自己上次留下的
-        _ECBUS['obf_busy'] = 0
+        if not _ec_obf_gate():
+            return _ec_fail()
         if not _ec_wait(True):
             return _ec_fail()
         if not wr_port(EC_CTRL, 0x80):      # ★2026-10-19: 原来丢掉返回值 —— 写失败也照样往下走
@@ -1179,10 +1206,12 @@ def ec_read_strict(off, tries=3):
 
     比 ec_read_ok 多两道: 每次读的前后夹一次哨兵 0xC9=65; 判废时把等待加大再来一遍。
     给"固件过热标志 0x89/0x8A/0x8B"这种一置位就要动手的寄存器用 —— 误读的代价是白压功耗。
+    tries=1 是风扇循环的"单笔快速读": 只做一轮哨兵校验就返回(动态寄存器两次一致
+    没有意义, 也不能为了等第二次把 2 秒控制循环拖住)。
     """
     prev = None
     delays = EC_RETRY_DELAYS
-    for i in range(max(2, tries)):
+    for i in range(max(1, tries)):
         d = max(delays[min(i, len(delays) - 1)], ec_bus_settle())
         c1 = ec_read(EC_CANARY[0], delay=d)
         v = ec_read(off, delay=d)
@@ -1194,6 +1223,9 @@ def ec_read_strict(off, tries=3):
             time.sleep(0.010)
             prev = None
             continue
+        if tries <= 1:
+            ec_bus_stat(False)
+            return v
         if prev is not None and v == prev:
             ec_bus_stat(False)
             return v
@@ -1210,7 +1242,9 @@ def ec_write(off, val, _locked=False):
     """写一个 EC 寄存器"""
     locked = _ec_lock() if not _locked else True
     try:
-        _ec_drain()
+        # 和读路径同一道门: OBF 挂着时先不写, 更不要 drain —— 那可能是 ACPI 的字节。
+        if not _ec_obf_gate():
+            return False
         if not _ec_wait(True):
             return False
         if not wr_port(EC_CTRL, 0x81):       # ★2026-10-19: 原来丢掉返回值, 写失败也返回 True
@@ -1323,9 +1357,9 @@ def ec_extra_temps():
 #   * 真正让 _TMP 返回 _HOT 的, 是 EC 自己的过热标志 0x89 / 0x8A / 0x8B (低 7 位非零),
 #     _TMP 一旦看到它就直接 Return (TCRT - 1) = 401K —— 这才是那次强制休眠的扳机。
 # 所以保护分两条线:
-#   1) 温度线(预防): EC 0x78 到 warn/crit 就砍功耗墙 + 风扇拉满;
+#   1) 温度线(预防): EC 0x78 到 warn/crit 就砍功耗墙(风扇由 T14sFanSvc 独立按温度接管);
 #   2) 固件标志线(最高级): 0x89/0x8A/0x8B 一置位 == 固件已经在报 _HOT,
-#      立刻压到最低功耗 + 风扇满速, 可选主动优雅休眠。
+#      立刻压到最低功耗, 可选主动优雅休眠(风扇档不由本工具写)。
 # 诚实说明: 我们看不到 EC 内部那颗真正决定它什么时候置标志的传感器, 所以第 1 条只是
 # "提前降温", 阈值是凭经验定的, 不是精确标定。
 _PL_OVERRIDE = None
@@ -1336,6 +1370,26 @@ def set_pl_override(pl1, pl2=None):
     只影响本进程(服务), 不写 config.json。"""
     global _PL_OVERRIDE
     _PL_OVERRIDE = None if not pl1 else (float(pl1), float(pl2 or pl1))
+
+
+def _profile_cap(cfg):
+    """当前电源档的上限(插电 28/55, 电池 20/28); 自动模式返回 (None, None)。
+    ★保护档只能在这个上限**以下**收紧 —— 电池上把 PL1 抬回 28W 等于绕过电池档。"""
+    p1, p2, _ = profile_pl(cfg)
+    if not p1:
+        return None, None
+    return float(p1), float(p2 or p1)
+
+
+def _set_guard_pl(cfg, pl1, pl2=None):
+    """guard_apply 专用: 写保护档前先按当前电源档封顶。"""
+    p1 = float(pl1)
+    p2 = float(pl2 or pl1)
+    c1, c2 = _profile_cap(cfg)
+    if c1 is not None:
+        p1 = min(p1, c1)
+        p2 = min(p2, c2)
+    set_pl_override(p1, p2)
 
 
 GUARD_MAX_JUMP = 15.0      # °C/轮: 相邻两次真读跳这么多就当天可疑读数, 下一轮确认
@@ -1402,6 +1456,14 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
             set_pl_override(None)
             return '过热保护: 配置里已关闭, 功耗墙恢复原档'
         return None
+    # ★AC -> 电池切换: 保护档可能还挂在 28/40W。这里每轮都按当前电源档重新封顶,
+    #   否则等级不变时不会重设 override, 电池上会一直跑插电档。
+    _cap1, _cap2 = _profile_cap(cfg)
+    if _PL_OVERRIDE and _cap1 is not None:
+        _p1 = min(_PL_OVERRIDE[0], _cap1)
+        _p2 = min(_PL_OVERRIDE[1], _cap2)
+        if (_p1, _p2) != _PL_OVERRIDE:
+            set_pl_override(_p1, _p2)
     hit = ec_tripped(flags) if g.get('trip_flags', True) else []   # 标志置位 -> 最高级
     if flags_fresh:
         # 必须连续两轮"真读"都读到才认 —— 单轮的垃圾读数(两个进程插队)不能让我们误判
@@ -1452,13 +1514,13 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
         # 旧条件要求"EC <= recover_c(78°C) 满 45 秒"才算锁存, 而 78°C 在本机偏苛刻:
         # 28W 满载的稳态就是 89~95°C —— 于是标志一挂上, 只要温度在 78~95°C 之间就被
         # **永久**压在 20/28W(不再自动放开)。现在改成:
-        #   连续 (ET <= flag_release_c, 默认 97°C) 达 flag_release_s(默认 60 秒)
+        #   连续 (ET <= flag_release_c, 默认 92°C) 达 flag_release_s(默认 60 秒)
         #   -> 判"固件锁存位, 不是真过热" -> 分级回升放开并保持(sticky)。
         # 关键是"连续": 中途温度升过线, 计时从头来 —— 所以不会 60 秒来回切。
-        # ★2026-10-20: 线从 95 提到 97。95 太贴满载稳态(89~95, 偶尔 96), "连续"会被
-        #   反复打断, 又退回"永远压着"; 97 仍低于 crit_c(98), 真过热由温度线接管。
+        # ★2026-10-21: 线从 97 降到 92(见 DEFAULT_CFG 注释) —— 97 只差 crit_c 1°C,
+        #   放开后 28/55W 正好在固件 _HOT 墙边; 92 留 6°C 余量, 真过热仍由温度线接管。
         _rc = g.get('flag_release_c')
-        rel_c = 97.0 if _rc is None else float(_rc)
+        rel_c = 92.0 if _rc is None else float(_rc)
         _rs = g.get('flag_release_s')
         if _rs is None:
             _rs = g.get('trip_hold_s')            # 兼容旧配置: 旧键语义 = 锁存判定秒数
@@ -1488,7 +1550,7 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
                 _G['ramp'] = (_steps + [None]) if _steps else None
                 _G['ramp_at'] = time.time()
                 if _G['ramp']:
-                    set_pl_override(_G['ramp'][0][0], _G['ramp'][0][1])
+                    _set_guard_pl(cfg, _G['ramp'][0][0], _G['ramp'][0][1])
                     _tail = '分级回升到 [%s](先 %.0f/%.0fW)' % (
                         pname, _G['ramp'][0][0], _G['ramp'][0][1])
                 else:
@@ -1516,25 +1578,11 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
             if adv:
                 return '过热保护解除后回升完成: 功耗墙已接回原档'
         else:
-            set_pl_override(st[0], st[1])
+            _set_guard_pl(cfg, st[0], st[1])
             if adv:
                 return ('过热保护解除后回升: PL1=%.0fW/PL2=%.0fW (每级 %.0f 秒, %s)'
                         % (st[0], st[1], _gv(g, 'ramp_step_s', 30.0),
                            '还要再抬一级' if len(_G['ramp']) > 1 else '这一级后接回原档'))
-
-    # ---- ★温度墙的"驻留"计时(2026-10-19) --------------------------------------
-    # 以前: 单次读到 >=crit_c 就立刻把功耗砍到 10W。现在: 持续 crit_hold_s 秒(默认 10 秒,
-    # 约一个 EC 采样周期)才进"严重"; 单次冲到 crit_now_c(默认 100°C = TjMax)才立即动手。
-    # 依据: 1360P 的 TjMax=100°C, 98°C 还有 2°C 余量; PL2(55W/6 秒)突发常造成瞬时尖峰,
-    # 单点就砍等于把尖峰当持续过热, 白丢几十秒性能(实测 10:59~11:04 白压过 4 次)。
-    if et is None or et < g['crit_c']:
-        _G['crit_since'] = None
-        if _G.get('level') in ('crit', 'crit2', 'crit3', 'trip'):
-            # ★掉到严重线以下 -> 阶梯计时也重新开始。否则"在 98°C 附近来回碰线"会被一路
-            #   加深到地板档(等于又回到"10W 白压"), 而真正的失控是"持续压不下来"。
-            _G['step_since'] = now
-    elif _G.get('crit_since') is None:
-        _G['crit_since'] = now
 
     # ★2026-10-20 新增: DTS 快通道。要**连续两拍**(2 秒一拍 = 4 秒)都高才动手 ——
     #   凉机上单核睿频的 DTS 尖峰也能到 86℃, 单拍就触发会把 PL2 白压 40 秒。
@@ -1542,6 +1590,34 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
               and dts >= _gv(g, 'dts_warn_c', 90.0) and et < g['warn_c'])
     prev_hi = bool(_G.get('dts_hi'))
     _G['dts_hi'] = dts_hi
+    # ★2026-10-21 新增: DTS 危险线(独立于 EC)。EC 0x78 15~20 秒才更新一次, 而 DTS
+    #   每拍(2 秒)都有新值; 等 EC 走到 98 再动手, 可能已经撞上 TjMax 被固件休眠。
+    #   ★线画在 99 而不是 97: 实测本机正常 40W 满载 DTS 就 99~100(EC 才 92)、
+    #   60 秒满载 99~100 也不关机 —— DTS 在满载时虚高, 97 会把正常满载当失控。
+    #   连续两拍 >= dts_crit_c(99) 才认; 单拍 >= dts_hot_now_c(100=TjMax) 直接认。
+    dts_sev_c = _gv(g, 'dts_crit_c', 99.0)
+    dts_now_c = _gv(g, 'dts_hot_now_c', 100.0)
+    dts_sev_hi = dts is not None and dts >= dts_sev_c
+    _G['dts_sev_hits'] = (int(_G.get('dts_sev_hits') or 0) + 1) if dts_sev_hi else 0
+    dts_sev = bool(dts_sev_hi and (_G['dts_sev_hits'] >= 2 or dts >= dts_now_c))
+
+    # ---- ★温度墙的"驻留"计时(2026-10-19) --------------------------------------
+    # 以前: 单次读到 >=crit_c 就立刻把功耗砍到 10W。现在: 持续 crit_hold_s 秒(默认 10 秒,
+    # 约两个 EC 采样周期)才进"严重"; 单次冲到 crit_now_c(99°C) 直接第二级,
+    # 冲到 crit_floor_c(100°C = TjMax) 直接地板 —— 不再一级一级等 15 秒。
+    # 依据: 1360P 的 TjMax=100°C, 98°C 还有 2°C 余量; PL2(55W/6 秒)突发常造成瞬时尖峰,
+    # 单点就砍等于把尖峰当持续过热, 白丢几十秒性能(实测 10:59~11:04 白压过 4 次)。
+    # ★DTS 危险期间不重置阶梯计时: EC 还滞后在 98 以下, 但 DTS 已经连高 4 秒 ——
+    #   这时要是按"EC 掉下严重线"重置, 就永远深不到地板档。
+    if (et is None or et < g['crit_c']) and not dts_sev:
+        _G['crit_since'] = None
+        if _G.get('level') in ('crit', 'crit2', 'crit3', 'trip'):
+            # ★掉到严重线以下 -> 阶梯计时也重新开始。否则"在 98°C 附近来回碰线"会被一路
+            #   加深到地板档(等于又回到"10W 白压"), 而真正的失控是"持续压不下来"。
+            _G['step_since'] = now
+    elif et is not None and et >= g['crit_c'] and _G.get('crit_since') is None:
+        _G['crit_since'] = now
+
     lv = None
     why = ''
     if hit and _G.get('trip_hits', 0) >= 2:
@@ -1549,12 +1625,16 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
         #   DTS 62°C / 倍频 43(4.3GHz) / 占用 10%; 01:03~04:28 那次在 36~51°C 挂了 3 小时;
         #   11:01 还在 55~74°C 的凉机上白压了两次 10W。它是固件"记录过一次过热"的锁存位。
         #   所以按温度分档:
-        #     温度也到 warn_c(或 DTS 到 dts_crit_c) -> 'trip' = 最高级, 砍 crit_pl(10W)
-        #     温度正常                              -> 'flag' = 只风扇满速 + 收到 flag_pl(20/28W)
+        #     温度也到 warn_c(或 DTS 到 dts_crit_c) -> 'trip' = 最高级, 走 crit 阶梯
+        #     温度正常                              -> 'flag' = 收到 flag_pl(20/28W), 风扇独立
         hot = ((et is not None and et >= g['warn_c'])
-               or (dts is not None and dts >= g.get('dts_crit_c', 97.0)))
+               or (dts is not None and dts >= dts_sev_c))
         lv = 'trip' if hot else 'flag'
         why = '固件标志'
+    elif dts_sev:
+        # ★EC 还没到 95/98 也照样压: DTS 是 CPU 自己的最大值, 比 EC 快 15~20 秒。
+        #   进 crit 后阶梯逻辑会强制从第二级起步(20/25), 不再等 EC 到 98。
+        lv, why = 'crit', 'DTS危险 %d°C' % dts
     elif dts_hi and prev_hi:
         # ★2026-10-20(DTS 快通道): EC 0x78 滞后 15~20 秒, 而 PL2=55W 从 82°C 冲到 100°C
         #   只要 20 秒 —— 等 EC 到 95°C 再动手就晚了(实测 12:09:18 核心已 100°C,
@@ -1569,7 +1649,7 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
             # ★已经在严重档时不许被"驻留门限"退回预警档 —— 否则单次 100°C 进来后, 下一轮
             #   99°C 会因为"计不满 10 秒"退成 warn(PL2 从 35 回到 40), 属于自造抖动。
             already = _G.get('level') in ('crit', 'crit2', 'crit3', 'trip')
-            if (already or et >= _gv(g, 'crit_now_c', 100.0)
+            if (already or et >= _gv(g, 'crit_now_c', 99.0)
                     or (now - float(_G.get('crit_since') or now))
                     >= _gv(g, 'crit_hold_s', 10.0)):
                 lv, why = 'crit', '温度'
@@ -1577,11 +1657,13 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
                 lv, why = 'warn', '温度(驻留中)'      # 驻留期内先只收 PL2
         elif et >= g['warn_c']:
             lv, why = 'warn', '温度'
-    elif dts is not None and dts >= g.get('dts_crit_c', 97.0):
-        why = 'DTS 兜底'
-        # EC 读不到时才拿 CPU DTS 兜底。本机 DTS(MSR 0x1B1) 满载时读数会乱走,
-        # 不能跟 EC 并列当触发条件 —— 否则会"压 10W -> 下一轮读回正常 -> 解除"地来回抖。
+    # ★2026-10-21: 第二/第三级是 20/25、12/14, 不能因为 EC 刚掉到 97 就立刻抬回
+    #   warn(28/40) —— 那样 95~98 会每 15 秒来回切一次。92~95 之间保持 crit 档;
+    #   真正解除仍只看下面的 ≤78°C 路径(再等 min_hold/release_dwell), 更保守。
+    if (_G.get('level') in ('crit2', 'crit3')
+            and et is not None and et >= g['warn_c'] - 3.0 and lv in (None, 'warn')):
         lv = 'crit'
+        why = '温度(回差保持)'
     # ★2026-10-20 审计修复: why 之前只在"阶梯加深"块(lv in ('crit','trip'))里持久化,
     #   warn 档一律丢失 -> 预警日志永远走 "EC xx°C >= 95°C" 模板, 于是 DTS 快通道
     #   触发时打成 "EC 71°C >= 95°C"(71 < 95) 这种自相矛盾的话。这里对所有档位统一持久化。
@@ -1624,7 +1706,7 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
             if _steps:
                 _G['ramp'] = _steps + [None]
                 _G['ramp_at'] = now
-                set_pl_override(_G['ramp'][0][0], _G['ramp'][0][1])
+                _set_guard_pl(cfg, _G['ramp'][0][0], _G['ramp'][0][1])
                 return ('过热保护解除(EC %d°C ≤ %.0f°C 且稳住 %.0f 秒): 功耗墙分级回升 [%s], '
                         '原保护等级 %s —— 先给 PL1=%.0fW/PL2=%.0fW, 每 %.0f 秒抬一级'
                         % (et, g['recover_c'], float(g.get('release_dwell_s') or 0.0), pname, old,
@@ -1638,23 +1720,37 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
         return None
     # ---- ★阶梯加深(2026-10-19): 已经在严重档而温度还压在墙上 -> 每 step_dwell_s 深一级
     WS = ('crit', 'crit2', 'crit3')
+    forced = False
+    ec_jump = et is not None and et >= _gv(g, 'crit_now_c', 99.0)
+    ec_floor = et is not None and et >= _gv(g, 'crit_floor_c', 100.0)
     if lv in ('crit', 'trip'):
         prev = _G.get('level') in WS
         step = int(_G.get('step') or 1) if prev else 1
         if prev:
             if et is not None and et >= g['escape_c']:
                 step = 3
-            elif (et is not None and et >= g['crit_c']
+            elif ((dts_sev or (et is not None and et >= g['crit_c']))
                   and (now - float(_G.get('step_since') or 0.0))
                   >= _gv(g, 'step_dwell_s', 15.0)):
                 step = min(3, step + 1)
+        # ★2026-10-21: 单次 EC 99(或 DTS 99/100)不再只走第一级 —— 第一级 PL1 仍是 28W,
+        #   只剩 1~2°C 余量时这点降幅不够; 直接跳第二级(20/25)。
+        #   EC 100(=TjMax) 直接下地板: 真关机那次就是 EC 98~99 拖了 100 秒被固件 S4。
+        #   逃生线(105°C)无论如何都直接到地板, 哪怕同时挂着固件标志/DTS 危险。
+        if (et is not None and et >= g['escape_c']) or ec_floor:
+            force = 3
+        else:
+            force = 2 if (ec_jump or dts_sev) else 0
+        if force and step < force:
+            step = force
+        forced = bool(not prev and force)
         if step != int(_G.get('step') or 0) or not prev:
             _G['step'] = step
             _G['step_since'] = now
         if why:
             # ★2026-10-19: "为什么"以**本轮**为准。原来只在"换级"时更新, 于是"温度线已经
             #   在 crit 档、固件标志这时才置位"这一路, _G['why'] 还是旧的'温度' ——
-            #   下面"标志触发时取更严的一档"(clamp)就不会生效, 手册 02 §4.1 那条规则落空。
+            #   下面"标志触发时取更严的一档"(clamp)就不会生效, 手册 02 §5 那条规则落空。
             _G['why'] = why
         lv = WS[step - 1]        # ★无论有没有换级, 等级都要对齐到当前级
     if lv == _G['level']:
@@ -1669,7 +1765,7 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
             tgt = (min(p1, fp1), min(p2, fp2))
             cur = _PL_OVERRIDE
             if cur[0] > tgt[0] + 0.01 or cur[1] > tgt[1] + 0.01:
-                set_pl_override(tgt[0], tgt[1])
+                _set_guard_pl(cfg, tgt[0], tgt[1])
                 return ('过热保护[固件标志]: 等级不变(%s)但固件标志要求更严的功耗档 —— '
                         '功耗墙收到 PL1=%.0fW/PL2=%.0fW(原来 %.0fW/%.0fW)'
                         % (lv, tgt[0], tgt[1], cur[0], cur[1]))
@@ -1690,7 +1786,7 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
         if clamp:
             p1 = min(p1, float(g.get('flag_pl1_w') or 20.0))
             p2 = min(p2, float(g.get('flag_pl2_w') or 28.0))
-        set_pl_override(p1, p2)
+        _set_guard_pl(cfg, p1, p2)
         tag = {1: '第一级', 2: '第二级', 3: '地板'}[step]
         nice = {1: 'PBP 28W 档', 2: 'Minimum Assured Power 20W 档',
                 3: '地板档(只留给 100°C 或持续压不下来)'}[step]
@@ -1699,19 +1795,36 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
                 _G['hibernate'] = True
                 return ('过热保护[固件标志]: EC %s —— 固件已把热区报成 _HOT(401K), '
                         '不等它强制断电, 立即主动休眠(S4)' % desc)
-            return ('过热保护[固件标志]: EC %s 且温度也高(EC %d°C ≥ %.0f°C) —— 功耗墙压到 '
+            if et is not None and et >= g['warn_c']:
+                hot_txt = 'EC %d°C ≥ %.0f°C' % (et, g['warn_c'])
+            else:
+                hot_txt = 'DTS %s ≥ %.0f°C' % (
+                    ('%d°C' % dts) if dts is not None else '--', dts_sev_c)
+            return ('过热保护[固件标志]: EC %s 且温度也高(%s) —— 功耗墙压到 '
                     '%s PL1=%.0fW/PL2=%.0fW(不比标志降温档%.0f/%.0fW 更松)'
                     '(已连续两轮确认)'
-                    % (desc, et, g['warn_c'], tag, p1, p2,
+                    % (desc, hot_txt, tag, p1, p2,
                        float(g.get('flag_pl1_w') or 20.0), float(g.get('flag_pl2_w') or 28.0)))
         if et is None:
             return ('过热保护[严重·%s]: EC 温度读不到, 用 CPU DTS %d°C 兜底 —— 功耗墙压到 '
                     'PL1=%.0fW/PL2=%.0fW' % (tag, dts, p1, p2))
+        if dts_sev and et < g['crit_c']:
+            return ('过热保护[严重·%s]: DTS %d°C ≥ %.0f°C 连续两拍(EC 才 %d°C, 0x78 滞后'
+                    ' 15~20 秒) —— 不等 EC 到 %.0f°C, 直接压到 PL1=%.0fW/PL2=%.0fW'
+                    % (tag, dts, dts_sev_c, et, g['crit_c'], p1, p2))
         if step == 1:
-            cond = ('单次就到 TjMax %.0f°C' % _gv(g, 'crit_now_c', 100.0)
-                    if et >= _gv(g, 'crit_now_c', 100.0)
+            cond = ('单次就到 %.0f°C' % _gv(g, 'crit_now_c', 99.0)
+                    if ec_jump
                     else 'EC ≥%.0f°C 已持续 ≥%.0f 秒' % (g['crit_c'],
                                                        _gv(g, 'crit_hold_s', 10.0)))
+        elif et is not None and et >= g['escape_c']:
+            cond = '逃生线 ≥%.0f°C' % g['escape_c']
+        elif forced and ec_floor:
+            cond = ('单次就到 TjMax %.0f°C, 直接下地板' % _gv(g, 'crit_floor_c', 100.0))
+        elif forced and dts_sev:
+            cond = 'DTS %d°C ≥ %.0f°C 连续两拍, 直接跳第二级' % (dts, dts_sev_c)
+        elif forced and ec_jump:
+            cond = ('单次就到 %.0f°C, 直接跳第二级' % _gv(g, 'crit_now_c', 99.0))
         else:
             cond = '上一级压了 ≥%.0f 秒仍 ≥%.0f°C' % (_gv(g, 'step_dwell_s', 15.0), g['crit_c'])
         return ('过热保护[严重·%s]: EC %d°C ≥ %.0f°C%s (%s) —— 功耗墙压到 PL1=%.0fW/PL2=%.0fW '
@@ -1719,8 +1832,8 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
                 % (tag, et, g['crit_c'], ('/DTS %d°C' % dts) if dts is not None else '',
                    cond, p1, p2, nice))
     if lv == 'flag':
-        set_pl_override(g.get('flag_pl1_w', g['warn_pl1_w']),
-                        g.get('flag_pl2_w', g['warn_pl2_w']))
+        _set_guard_pl(cfg, g.get('flag_pl1_w', g['warn_pl1_w']),
+                      g.get('flag_pl2_w', g['warn_pl2_w']))
         return ('过热保护[固件标志-降温]: EC %s 置位, 但温度正常(EC %s, DTS %s) —— 只把'
                 '功耗墙收到 PL1=%.0fW/PL2=%.0fW(不砍到 %.0fW); 满 %.0f 秒还这么凉就判'
                 '"锁存"放开(温度线 %g/%g 全程有效)'
@@ -1729,7 +1842,7 @@ def guard_apply(cfg, et, dts=None, flags=None, flags_fresh=True):
                    g.get('flag_pl1_w', 20.0), g.get('flag_pl2_w', 28.0),
                    g['crit_pl1_w'], hold, g['warn_c'], g['crit_c']))
     p1w = float(g.get('warn_pl1_w') or 0.0) or float(profile_pl(cfg)[0] or 0.0) or 40.0
-    set_pl_override(p1w, float(g.get('warn_pl2_w') or 40.0))
+    _set_guard_pl(cfg, p1w, float(g.get('warn_pl2_w') or 40.0))
     # ★2026-10-20: 预警可能由**两条不同的路**触发, 文案必须说清是哪条:
     #   ① 温度线: EC >= warn_c(95°C)
     #   ② DTS 快通道: EC 还没到 95°C, 但 DTS >= dts_warn_c(90°C) 连高两拍 -> 先收 PL2
@@ -2126,13 +2239,15 @@ def cmd_check():
                        '由 T14scontrol\\fan (FanControl) 独立控制 —— 本工具不读不写 0x2F/0x84/0x85'))
         out('%s %s' % (_pad('过热保护', 26),
                        ('已开启  预警 %.0f°C->收 PL2 到 %.0fW(PL1 不动)  严重 %.0f°C 持续 %.0f 秒 -> '
-                        '%.0f/%.0fW -> %.0f/%.0fW -> %.0f/%.0fW  单次 %.0f°C 立即  逃生 %.0f°C%s'
+                        '%.0f/%.0fW -> %.0f/%.0fW -> %.0f/%.0fW  单次 %.0f°C 第二级 / %.0f°C 地板  '
+                        '逃生 %.0f°C%s'
                         % (g['warn_c'], float(g.get('warn_pl2_w') or 40.0), g['crit_c'],
                            float(g.get('crit_hold_s') or 10.0),
                            g['crit_pl1_w'], g['crit_pl2_w'],
                            float(g.get('crit2_pl1_w') or 20.0), float(g.get('crit2_pl2_w') or 25.0),
                            float(g.get('crit3_pl1_w') or 12.0), float(g.get('crit3_pl2_w') or 14.0),
-                           float(g.get('crit_now_c') or 100.0), g['escape_c'],
+                           float(g.get('crit_now_c') or 99.0),
+                           float(g.get('crit_floor_c') or 100.0), g['escape_c'],
                            '(主动休眠)' if g.get('escape_hibernate') else ''))
                        if g.get('enabled') else '已关闭'))
         last = _last_guard_line()
@@ -2382,7 +2497,12 @@ def _pick_profile(cfg):
     """按当前电源状态选档。返回 (pl1, pl2, 档位名); pl1=None 表示自动模式。
     过热保护生效时由 _PL_OVERRIDE 覆盖(看守服务每轮重新对齐)。"""
     if _PL_OVERRIDE:
-        return _PL_OVERRIDE[0], _PL_OVERRIDE[1], '过热保护'
+        p1, p2 = _PL_OVERRIDE
+        c1, c2 = _profile_cap(cfg)      # 双保险: 电池上绝不让保护档超过电池档
+        if c1 is not None:
+            p1 = min(p1, c1)
+            p2 = min(p2, c2)
+        return p1, p2, '过热保护'
     c1 = float(cfg['pl1_w'] or 0)
     c2 = float(cfg['pl2_w'] or 0)
     b1 = float(cfg.get('pl1_w_batt') or 0)
@@ -2416,8 +2536,7 @@ def sync_msr(pl1, pl2):
     new = build_pl(pl1, pl2, d['pl1_t'] or 35, d['pl2_t'] or 66, bool(d['lock']))
     if new == v:
         return True
-    wrmsr(MSR_PKG_POWER_LIMIT, new)
-    return True
+    return wrmsr(MSR_PKG_POWER_LIMIT, new)
 
 
 def ensure_profile(cfg):
@@ -2440,9 +2559,11 @@ def ensure_profile(cfg):
     # 1) MSR 侧同步 —— disable 模式下的唯一控制通道, value 模式下的实时下调通道
     if pl1 is not None and (abs(d_m['pl1_w'] - pl1) > 0.5 or abs(d_m['pl2_w'] - pl2) > 0.5):
         try:
-            sync_msr(pl1, pl2)
-            notes.append('MSR PL1 %.1f->%.1fW PL2 %.1f->%.1fW'
-                         % (d_m['pl1_w'], pl1, d_m['pl2_w'], pl2))
+            if sync_msr(pl1, pl2):
+                notes.append('MSR PL1 %.1f->%.1fW PL2 %.1f->%.1fW'
+                             % (d_m['pl1_w'], pl1, d_m['pl2_w'], pl2))
+            else:
+                notes.append('MSR 同步失败: 写 0x610 没成功')
         except Exception as e:
             notes.append('MSR 同步失败: %s' % e)
 
@@ -2580,8 +2701,12 @@ def cmd_fix(quiet=False):
             if sync_msr(pl1, pl2):
                 msr_after = decode_pl(rdmsr(MSR_PKG_POWER_LIMIT))
                 out('MSR 同步 : PL1=%.2fW PL2=%.2fW' % (msr_after['pl1_w'], msr_after['pl2_w']))
+            else:
+                out('[X] MSR 同步失败: 写 0x610 没成功')
+                ok = False
         except Exception as e:
             out('[!] MSR 同步失败(不影响 MMIO 锁定): %s' % e)
+            ok = False
 
     back = rdphys(mmio_addr, 8)
     d_b = decode_pl(back) if back is not None else None
@@ -2823,7 +2948,7 @@ def cmd_install():
     if gone:
         out('[i] 已清理旧版独立风扇任务: %s (风扇现在由 T14scontrol\\fan 独立负责)' % ', '.join(gone))
     out('')
-    out('安装完成。开机、登录、睡眠唤醒、休眠恢复都会自动修复 功耗墙 + 过热保护(风扇请用 ..\\fan\\1-启动风扇控制.bat), 日志在 %s' % LOG_DIR)
+    out('安装完成。开机、登录、睡眠唤醒、休眠恢复都会自动修复 功耗墙 + 过热保护(风扇请用 ..\\fan\\1-安装风扇服务.bat), 日志在 %s' % LOG_DIR)
     return rc
 
 
@@ -2889,7 +3014,7 @@ def cmd_boot():
         th = thermal_hib_info()
         if th:
             out('[*] 注意: 上一次是**固件热事件强制休眠**(Kernel-Power 88, %s) —— 不是掉电, '
-                '会话已落盘、程序都还在; 固件热区 _TZ.THM0 报 _HOT 就会这样(手册 02 §3.2)' % th)
+                '会话已落盘、程序都还在; 固件热区 _TZ.THM0 报 _HOT 就会这样(手册 02 §4.2)' % th)
     if not ensure_driver(verbose=True):
         out('[X] 驱动加载失败 (系统已运行 %.1f 秒)' % uptime())
         flush_log('boot')
@@ -3153,7 +3278,10 @@ def cmd_power():
     out()
     out('--- 实测封装功率（MSR 0x611 能量计数器）---')
     unit = rdmsr(0x606)
-    e_unit = (1.0 / (1 << 16)) if unit else (1.0 / 65536.0)
+    # RAPL 能量单位: 0x606 bits 12:8 = E, 1 LSB = 2^-E 焦(本机 E=14, 即 61 µJ)。
+    # 原来写死 2^-16, 会把功率算成实际的 4 倍(65536/16384)。
+    e_exp = ((unit >> 8) & 0x1F) if unit is not None else 14
+    e_unit = 1.0 / float(1 << e_exp)
     e0 = rdmsr(0x611)
     if e0 is None:
         out('  读不到能量计数器')
@@ -3229,7 +3357,7 @@ def cmd_power():
 #
 # 为什么不能直接拿保护阶梯(guard_apply)当调速器:
 #   阶梯是"只降不升"的 —— 释放条件是 EC <= recover_c(78°C), 而热着的机器根本到不了 78°C,
-#   于是它会一路踩到地板档(12W)并且**永远停在那**(手册 02 §3.1 记过同款 bug:
+#   于是它会一路踩到地板档(12W)并且**永远停在那**(手册 02 §4.3 记过同款 bug:
 #   "凉机上被白压两次 10W")。所以日常调速必须是一个**独立、带回差、能升回来**的调节器,
 #   保护阶梯只留作硬保护(98/105°C 那两级)。
 #

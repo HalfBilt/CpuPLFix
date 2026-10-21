@@ -3,13 +3,13 @@
 
     CpuPLFixCfg.py             看当前配置
     CpuPLFixCfg.py ac=40,55    改插电 PL1/PL2
-    CpuPLFixCfg.py hold=45 改固件标志锁存判定秒数（0=关掉这条出口）
+    CpuPLFixCfg.py hold=60 改固件标志锁存判定秒数（0=关掉这条出口）
     CpuPLFixCfg.py tpower=on/off 温度→功耗调节器（日常功耗跟着温度走；默认 off）
-    CpuPLFixCfg.py flag_pl=20,28 标志置位但温度正常时的 PL1,PL2（默认=预警档，不砍到 10W）
+    CpuPLFixCfg.py flag_pl=20,28 标志置位但温度正常时的 PL1,PL2（默认 20/28W，比预警档更紧）
     CpuPLFixCfg.py gmin=30 保护最短驻留秒数 / rel=10 解除驻留秒数
     CpuPLFixCfg.py flag_slow=120 凉机时固件标志读的间隔（秒）
-    CpuPLFixCfg.py flag_rel=95,60 标志挂着但温度连续 ≤95°C 满 60 秒就自动放开
-    CpuPLFixCfg.py warn_pl2=40 预警档只收 PL2 到 40W（PL1 不动）
+    CpuPLFixCfg.py flag_rel=97,60 标志挂着但温度连续 ≤97°C 满 60 秒就自动放开
+    CpuPLFixCfg.py warn_pl2=35 预警档收 PL2 到 35W（PL1 由 warn_pl1 单独设，默认保持 28W 不动）
     CpuPLFixCfg.py crit_hold=10 严重档驻留 10 秒（压不下来才算数）
     CpuPLFixCfg.py step_dwell=15 每级压 15 秒没效果就再深一级
     CpuPLFixCfg.py ramp=30 解除后每级回升 30 秒
@@ -93,7 +93,10 @@ def show(cfg):
           % (g['warn_c'], g['crit_c'], g['escape_c'], g['recover_c']))
     print('  pl_guard=%g,%g,%g,%g        预警 PL1,PL2 / 严重 PL1,PL2（W）'
           % (g['warn_pl1_w'], g['warn_pl2_w'], g['crit_pl1_w'], g['crit_pl2_w']))
-    print('  dts=%g             EC 读不到时的 DTS 兜底（C）' % g['dts_crit_c'])
+    print('  dts=%g             DTS 危险线：连续两拍 ≥ 它就至少进第二级（20/25W，C）'
+          % g['dts_crit_c'])
+    print('  dts_now=%g        DTS 单拍 ≥ 它（TjMax）就立即进第二级'
+          % g.get('dts_hot_now_c', 100.0))
     print('  dts_warn=%g         DTS 快通道：EC 还没到预警线就先收 PL2（C，0=关）'
           % (g.get('dts_warn_c') or 0.0))
     print('  flag_hot=%g        固件标志加密温度（C）' % g['flag_hot_c'])
@@ -104,9 +107,9 @@ def show(cfg):
           % g.get('trip_hold_s', 45.0))
     print('  tpower=%s          温度→功耗调节器（风扇优先：日常功耗跟着温度走；关=用固定 pl1_w）'
           % onoff(g.get('temp_power', False)))
-    print('  flag_pl=%g,%g       标志置位但温度正常时的 PL1,PL2（不砍到 crit 的 10W）'
+    print('  flag_pl=%g,%g       标志置位但温度正常时的 PL1,PL2（不砍到地板档）'
           % (g.get('flag_pl1_w', 20.0), g.get('flag_pl2_w', 28.0)))
-    print('  gmin=%g  rel=%g     保护最短驻留 / 解除驻留（秒，防 40W↔10W 来回切）'
+    print('  gmin=%g  rel=%g     保护最短驻留 / 解除驻留（秒，防保护档来回切）'
           % (g.get('min_hold_s', 30.0), g.get('release_dwell_s', 10.0)))
     print('  cool_tail 已移除（风扇分离后由 fan 工具管）')
     print('  严重档三级          %.0f/%.0fW -> %.0f/%.0fW -> %.0f/%.0fW（PBP -> Minimum '
@@ -116,14 +119,16 @@ def show(cfg):
              g.get('crit3_pl1_w', 12.0), g.get('crit3_pl2_w', 14.0)))
     print('  crit_hold=%g       驻留：持续这么久 ≥严重线才进严重档（0=碰线就动作）'
           % g.get('crit_hold_s', 10.0))
+    print('  crit_now=%g / floor=%g  单次 EC 到它就跳第二级 / 到它就下地板（C）'
+          % (g.get('crit_now_c', 99.0), g.get('crit_floor_c', 100.0)))
     print('  step_dwell=%g      每级停留这么久还压不下来就再深一级（秒）'
           % g.get('step_dwell_s', 15.0))
     print('  ramp=%g            解除后每级回升秒数（0=直接回原档）'
           % g.get('ramp_step_s', 30.0))
     print('  flag_rel=%g,%g    标志挂着但温度连续 ≤该线 达该秒数 -> 判固件锁存、自动放开'
-          '（0 秒=不自动解除；该线默认 97，低于 crit_c 98）'
-          % (g.get('flag_release_c', 97.0), g.get('flag_release_s', 60.0)))
-    print('  warn_pl2=%g        预警档只把 PL2 收到这里（PL1 不动；warn_pl1_w>0 才压 PL1）'
+          '（0 秒=不自动解除；该线默认 92，比 crit_c 98 低 6°C，留出安全余量）'
+          % (g.get('flag_release_c', 92.0), g.get('flag_release_s', 60.0)))
+    print('  warn_pl2=%g        预警档 PL2 收到这里（PL1 由 warn_pl1 单独设，默认 28W 不动）'
           % g.get('warn_pl2_w', 40.0))
     print()
     print('改值：3-config.bat ac=40,55   |   撤销：3-config.bat undo   |   全部用法：3-config.bat help')

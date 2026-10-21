@@ -18,11 +18,11 @@
     "crit_c": 98.0,
     "escape_c": 105.0,
     "recover_c": 78.0,
-    "warn_pl1_w": 0.0,
+    "warn_pl1_w": 28.0,
     "warn_pl2_w": 40.0,
     "crit_pl1_w": 28.0,
     "crit_pl2_w": 35.0,
-    "dts_crit_c": 97.0,
+    "dts_crit_c": 99.0,
     "flag_hot_c": 85.0,
     "trip_flags": true,
     "escape_hibernate": false,
@@ -36,7 +36,8 @@
     "crit3_pl1_w": 12.0,
     "crit3_pl2_w": 14.0,
     "crit_hold_s": 10.0,
-    "crit_now_c": 100.0,
+    "crit_now_c": 99.0,
+    "crit_floor_c": 100.0,
     "step_dwell_s": 15.0,
     "ramp_step_s": 30.0,
     "ramp_pls": [
@@ -49,9 +50,10 @@
         35.0
       ]
     ],
-    "flag_release_c": 97.0,
+    "flag_release_c": 92.0,
     "flag_release_s": 60.0,
-    "dts_warn_c": 90.0
+    "dts_warn_c": 90.0,
+    "dts_hot_now_c": 100.0
   },
-  "comment": "本机实用配置（只管 CPU：功耗墙 + 过热保护；风扇已拆到 T14scontrol\\fan）。插电 PL1=28W(=i7-1360P 的 PBP) / PL2=55W(突发, 窗口 5 秒); 电池 20/28W。mmio_mode=disable: 开机把固件侧 MMIO 清零+锁, 之后只写 MSR, 改配置/拔插电免重启。温度墙: 预警 95C 只收 PL2 到 40W; 严重 98C 持续 10 秒(或单次 100C=TjMax) -> 28/35 -> 20/25 -> 12/14, 每级 15 秒; 解除 EC<=78C 稳住 10 秒后按 20/25 -> 28/35 -> 原档, 每级 30 秒回升。固件标志锁存时走 flag 档 20/28W, 温度连续 <=97C 满 60 秒自动放开。改配置 1 分钟内生效。详见 README。"
+  "comment": "本机实用配置（只管 CPU：功耗墙 + 过热保护；风扇已拆到 T14scontrol\\fan）。插电 PL1=28W(=i7-1360P 的 PBP) / PL2=55W(突发, 窗口 5 秒); 电池 20/28W。mmio_mode=disable: 开机把固件侧 MMIO 清零+锁, 之后只写 MSR, 改配置/拔插电免重启。温度墙: 预警 95C 只收 PL2 到 40W; 严重 98C 持续 10 秒 -> 28/35 -> 20/25 -> 12/14, 每级 15 秒, 单次 99C 直接 20/25, 单次 100C=TjMax 直接 12/14; DTS 99C 连两拍或 100C 单拍也直接 20/25; 解除 EC<=78C 稳住 10 秒后按 20/25 -> 28/35 -> 原档, 每级 30 秒回升。固件标志锁存时走 flag 档 20/28W, 温度连续 <=92C 满 60 秒自动放开。改配置 1 分钟内生效。详见 README。"
 }

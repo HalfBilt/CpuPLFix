@@ -7,10 +7,11 @@
   3. 0.4GHz 状态下 Windows 自身启动极慢, 服务比计划任务更早拿到执行机会
 
 每轮干活(调 CpuPLFix.tick):
-  (按节奏读 EC 温度) -> 过热保护(必要时压功耗墙) -> 对齐功耗墙/电源档 -> (按节奏)写风扇档位
+  (按节奏读 EC 温度) -> 过热保护(必要时压功耗墙) -> 对齐功耗墙/电源档
+  (风扇已拆到独立服务 T14sFanSvc, 本服务不写 EC)
 
 轮询节奏由 CpuPLFix.poll_plan 按 config 的 poll_s/ec_poll_s/flag_poll_s 算:
-  主循环(功耗墙/电源档, 只碰 MSR/MMIO)默认 5 秒; EC 读(温度 + 风扇档位)默认 15 秒;
+  主循环(功耗墙/电源档, 只碰 MSR/MMIO)默认 5 秒; EC 读(温度)默认 15 秒;
   固件过热标志默认 30 秒。开机前 5 分钟、过热保护生效期间、EC 温度超过 guard.flag_hot_c
   时都会自动加密 —— 目的是少打扰慢速的 EC(本机实测 EC 偶尔会串位/超时)。
 
@@ -50,11 +51,13 @@ def _pub_status():
     try:
         v = cpf.rdmsr(0x198) or 0
         t = cpf.rdmsr(0x1B1)
+        tj = ((cpf.rdmsr(0x1A2) or 0) >> 16) & 0xFF
+        tj = tj if 50 <= tj <= 120 else 100
         pl = cpf.decode_pl(cpf.rdmsr(cpf.MSR_PKG_POWER_LIMIT) or 0)
         obj = {
             'freq_mhz': ((v >> 8) & 0xFF) * 100,   # 0x198 的 15:8 位是倍频(100MHz/档)
             'ec': cpf.last_ec_temp(),
-            'dts': (100 - ((t >> 16) & 0x7F)) if t else None,
+            'dts': (tj - ((t >> 16) & 0x7F)) if t else None,
             'level': cpf.guard_level(),
             'pl1': round(pl['pl1_w'], 1),
             'pl2': round(pl['pl2_w'], 1),

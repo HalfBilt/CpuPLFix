@@ -3,7 +3,7 @@
 
 覆盖:
   1) guard_apply 的温度线三级阶梯 / 驻留 / 解除 / 分级回升
-  2) 固件标志线: 两轮确认 / 读失败不放开 / 97°C 连续 60 秒判锁存 / 98°C 重置
+  2) 固件标志线: 两轮确认 / 读失败不放开 / 92°C 连续 60 秒判锁存 / 93°C 重置
   3) 拆分后本工具**不该再有**任何风扇符号(fan_tick / set_fan / ec_rpm / FAN_LEVEL_RPM …)
   4) poll_plan 的节奏(凉机 120 秒 / 保护期 5-5-15 / 开机 2-5-10)
   5) MSR 0x610 时间窗解码: _tau_s 与 _pl_time 必须一致(SDM: 8 秒 / 5 秒)
@@ -69,16 +69,18 @@ CFG = {
     'pl1_w': 28.0, 'pl2_w': 55.0, 'pl1_w_batt': 20.0, 'pl2_w_batt': 28.0,
     'guard': {
         'enabled': True, 'warn_c': 95.0, 'crit_c': 98.0, 'escape_c': 105.0,
-        'crit_now_c': 100.0, 'crit_hold_s': 10.0, 'step_dwell_s': 15.0,
+        'crit_now_c': 99.0, 'crit_floor_c': 100.0, 'crit_hold_s': 10.0,
+        'step_dwell_s': 15.0,
         'recover_c': 78.0, 'min_hold_s': 30.0, 'release_dwell_s': 10.0,
-        'flag_release_c': 97.0, 'flag_release_s': 60.0,
+        'flag_release_c': 92.0, 'flag_release_s': 60.0,
         'flag_pl1_w': 20.0, 'flag_pl2_w': 28.0,
         'warn_pl1_w': 0.0, 'warn_pl2_w': 40.0,
         'crit_pl1_w': 28.0, 'crit_pl2_w': 35.0,
         'crit2_pl1_w': 20.0, 'crit2_pl2_w': 25.0,
         'crit3_pl1_w': 12.0, 'crit3_pl2_w': 14.0,
         'ramp_pls': [[20.0, 25.0], [28.0, 35.0]], 'ramp_step_s': 30.0,
-        'trip_flags': True, 'temp_power': False, 'dts_crit_c': 97.0,
+        'trip_flags': True, 'temp_power': False, 'dts_crit_c': 99.0,
+        'dts_hot_now_c': 100.0, 'dts_warn_c': 90.0,
         'cool_tail_s': 30.0,
     },
 }
@@ -96,7 +98,7 @@ def reset(t0=1000.0):
                    'trip_hits': 0, 'trip_since': None, 'trip_latched': False,
                    'cool_since': None, 'released_at': 0.0, 'crit_since': None,
                    'step': 0, 'step_since': 0.0, 'why': '', 'ramp': None, 'ramp_at': 0.0,
-                   'clr_hits': 0, 'flag_ok_since': None})
+                   'clr_hits': 0, 'flag_ok_since': None, 'dts_hi': False, 'dts_sev_hits': 0})
 
 
 def tick(et, dts=None, flags=None, fresh=True, dt=0.0):
@@ -106,7 +108,7 @@ def tick(et, dts=None, flags=None, fresh=True, dt=0.0):
 
 
 # ================================================================ 1. 温度线
-print('=== 1. 温度线: 95 预警 / 98 驻留 10 秒 / 100 立即 / 105 逃生 ===')
+print('=== 1. 温度线: 95 预警 / 98 驻留 10 秒 / 99 第二级 / 100 地板 / 105 逃生 ===')
 reset()
 chk('EC 94°C 不动', tick(94) is None, 'level=%r' % cpf._G['level'])
 m = tick(95)
@@ -116,26 +118,50 @@ chk('EC 98°C 第 1 次: 驻留中, 仍是预警', cpf._G['level'] == 'warn',
     'level=%r' % cpf._G['level'])
 tick(98)                                   # 第一次触 98 才开始计驻留
 m = tick(98, dt=10.0)
-chk('驻留满 10 秒 -> 严重', cpf._G['level'] == 'crit' and '严重' in (m or ''),
-    'level=%r' % cpf._G['level'])
+chk('驻留满 10 秒 -> 严重(第一级 28/35)',
+    cpf._G['level'] == 'crit' and cpf._PL_OVERRIDE == (28.0, 35.0) and '严重' in (m or ''),
+    'level=%r PL=%r' % (cpf._G['level'], cpf._PL_OVERRIDE))
+reset()
+m = tick(99)
+chk('单次 99°C -> 直接第二级 20/25(不先走 28/35)',
+    cpf._G['level'] == 'crit2' and cpf._G['step'] == 2
+    and cpf._PL_OVERRIDE == (20.0, 25.0),
+    'level=%r step=%r PL=%r' % (cpf._G['level'], cpf._G['step'], cpf._PL_OVERRIDE))
 reset()
 m = tick(100)
-chk('单次 100°C(=crit_now_c) 立即严重', cpf._G['level'] == 'crit', 'level=%r' % cpf._G['level'])
+chk('单次 100°C(TjMax) -> 直接地板 12/14',
+    cpf._G['level'] == 'crit3' and cpf._PL_OVERRIDE == (12.0, 14.0),
+    'level=%r PL=%r' % (cpf._G['level'], cpf._PL_OVERRIDE))
 m = tick(105)
-chk('EC 105°C -> 逃生(第三级)', cpf._G['level'] == 'crit3', 'level=%r' % cpf._G['level'])
+chk('EC 105°C -> 地板 12/14', cpf._G['level'] == 'crit3'
+    and cpf._PL_OVERRIDE == (12.0, 14.0),
+    'level=%r PL=%r' % (cpf._G['level'], cpf._PL_OVERRIDE))
 
 print('=== 2. 三级阶梯: 每级 step_dwell_s(15 秒) 深一级 ===')
 reset()
-tick(100)                                  # 立即 crit
+tick(98); tick(98, dt=10.0)                # 驻留满 -> 第一级
+chk('第一级 = 28/35', cpf._G['level'] == 'crit' and cpf._PL_OVERRIDE == (28.0, 35.0),
+    'level=%r PL=%r' % (cpf._G['level'], cpf._PL_OVERRIDE))
 m = tick(99, dt=15.0)
-chk('15 秒后 -> 第二级 20/25', cpf._G['level'] == 'crit2', 'level=%r' % cpf._G['level'])
+chk('15 秒后 -> 第二级 20/25', cpf._G['level'] == 'crit2'
+    and cpf._PL_OVERRIDE == (20.0, 25.0),
+    'level=%r PL=%r' % (cpf._G['level'], cpf._PL_OVERRIDE))
 m = tick(99, dt=15.0)
-chk('再 15 秒 -> 第三级 12/14', cpf._G['level'] == 'crit3', 'level=%r' % cpf._G['level'])
+chk('再 15 秒 -> 第三级 12/14', cpf._G['level'] == 'crit3'
+    and cpf._PL_OVERRIDE == (12.0, 14.0),
+    'level=%r PL=%r' % (cpf._G['level'], cpf._PL_OVERRIDE))
 chk('地板是 12/14(不是 10W)', cpf._G.get('level') == 'crit3')
+
+print('=== 2b. 99°C 跳级后仍高: 15 秒才到地板 ===')
+reset()
+tick(99)
+NOW[0] += 15
+m = tick(99)
+chk('99 进来是第二级, 15 秒后 -> 地板', cpf._G['level'] == 'crit3')
 
 print('=== 3. 解除: min_hold_s(30) + release_dwell_s(10) 都要满足 ===')
 reset()
-tick(100)                                  # 进 crit, since=NOW
+tick(98); tick(98, dt=10.0)                # 进 crit 第一级, since=NOW+10
 NOW[0] += 20.0
 tick(77)
 chk('驻留不足 30 秒: 不解除', cpf._G['level'] == 'crit', 'level=%r' % cpf._G['level'])
@@ -165,7 +191,7 @@ chk('warn 解除: 直接回原档(ramp=None)', cpf._G.get('ramp') is None,
 chk('warn 解除日志说"直接恢复原档"', '直接恢复原档' in (m or ''), (m or '')[:60])
 
 reset()
-tick(100)                                  # crit 档: 28/35
+tick(98); tick(98, dt=10.0)                # crit 档: 28/35
 NOW[0] += 35
 tick(77)
 NOW[0] += 11
@@ -174,9 +200,7 @@ chk('crit 解除: PL1 不低于 28W', (cpf._PL_OVERRIDE or (0, 0))[0] >= 28.0,
     'override=%r' % (cpf._PL_OVERRIDE,))
 
 reset()
-tick(100)
-NOW[0] += 15
-tick(99)                                   # -> crit2 (20/25)
+tick(99)                                   # 直接 crit2 (20/25)
 NOW[0] += 35
 tick(77)
 NOW[0] += 11
@@ -184,8 +208,59 @@ tick(77)
 chk('crit2 解除: 从 20/25 起(不跳过也不倒退)',
     cpf._PL_OVERRIDE == (20.0, 25.0), 'override=%r' % (cpf._PL_OVERRIDE,))
 
+print('=== 3c. ★电池档封顶: 保护档不得超过 20/28W ===')
+cpf.on_ac = lambda: False
+reset()
+tick(95)
+chk('电池上预警 = 20/28(不是 28/40)', cpf._PL_OVERRIDE == (20.0, 28.0),
+    'override=%r' % (cpf._PL_OVERRIDE,))
+cpf.on_ac = lambda: True
+reset()
+tick(95)                                   # AC warn 28/40
+cpf.on_ac = lambda: False
+tick(95)                                   # 等级不变, 但电源切到电池
+chk('AC -> 电池(等级不变)也立即封顶 20/28', cpf._PL_OVERRIDE == (20.0, 28.0),
+    'override=%r' % (cpf._PL_OVERRIDE,))
+reset()
+tick(98); tick(98, dt=10.0)
+chk('电池上严重第一级 = 20/28(不是 28/35)', cpf._PL_OVERRIDE == (20.0, 28.0),
+    'override=%r' % (cpf._PL_OVERRIDE,))
+reset()
+tick(105)
+chk('电池上地板仍是 12/14(封顶不会反向抬高)',
+    cpf._PL_OVERRIDE == (12.0, 14.0), 'override=%r' % (cpf._PL_OVERRIDE,))
+cpf.on_ac = lambda: True
+
+print('=== 3d. ★DTS 危险线: EC 滞后时也能提前降档 ===')
+reset()
+tick(80, dts=96)
+chk('DTS 96 单拍不动作', cpf._G['level'] is None, 'level=%r' % cpf._G['level'])
+tick(80, dts=96)
+chk('DTS 96 两拍只到预警(不跳严重)', cpf._G['level'] == 'warn',
+    'level=%r' % cpf._G['level'])
+reset()
+tick(80, dts=98)
+tick(80, dts=98)
+chk('DTS 98 两拍只到预警(正常满载不砍 PL1)',
+    cpf._G['level'] == 'warn' and cpf._PL_OVERRIDE == (28.0, 40.0),
+    'level=%r PL=%r' % (cpf._G['level'], cpf._PL_OVERRIDE))
+reset()
+tick(80, dts=99)
+chk('DTS 99 单拍不动作(要连续两拍)', cpf._G['level'] is None,
+    'level=%r' % cpf._G['level'])
+NOW[0] += 2
+tick(80, dts=99)
+chk('DTS 99 两拍 -> 第二级 20/25(EC 才 80°C)',
+    cpf._G['level'] == 'crit2' and cpf._PL_OVERRIDE == (20.0, 25.0),
+    'level=%r PL=%r' % (cpf._G['level'], cpf._PL_OVERRIDE))
+reset()
+tick(80, dts=100)
+chk('DTS 100(TjMax) 单拍 -> 立即第二级', cpf._G['level'] == 'crit2'
+    and cpf._PL_OVERRIDE == (20.0, 25.0),
+    'level=%r PL=%r' % (cpf._G['level'], cpf._PL_OVERRIDE))
+
 # ================================================================ 4. 固件标志
-print('=== 4. 固件标志: 两轮确认 / 读失败不放开 / 97°C 60 秒判锁存 ===')
+print('=== 4. 固件标志: 两轮确认 / 读失败不放开 / 92°C 60 秒判锁存 ===')
 reset()
 m = tick(90, flags=FLAG_ON)
 chk('第 1 轮只提示', m is not None and '再确认' in m, (m or '')[:30])
@@ -197,27 +272,27 @@ for _ in range(6):                          # 30 秒, 全部"沿用缓存"
 chk('读失败(沿用缓存)不放开', cpf._G['level'] == 'flag', 'level=%r' % cpf._G['level'])
 for _ in range(7):                          # 再 35 秒, 累计 65 秒
     tick(90, flags=FLAG_ON, dt=5.0)
-chk('连续 ≤97°C 满 60 秒 -> 判锁存放开', bool(cpf._G.get('trip_latched')),
+chk('连续 ≤92°C 满 60 秒 -> 判锁存放开', bool(cpf._G.get('trip_latched')),
     'latched=%r level=%r' % (cpf._G.get('trip_latched'), cpf._G['level']))
 chk('锁存放开是 sticky(标志还挂着也不回 flag)',
     tick(90, flags=FLAG_ON, dt=5.0) is None and cpf._G['level'] is None,
     'level=%r' % cpf._G['level'])
 
-print('=== 5. 97 边界: 96 不重置 / 98 重置并交给温度线 ===')
+print('=== 5. 92 边界: 91 不重置 / 93 重置并交给温度线 ===')
 reset()
 tick(90, flags=FLAG_ON); tick(90, flags=FLAG_ON)      # 进 flag
 for _ in range(6):
     tick(90, flags=FLAG_ON, dt=5.0)                   # 30 秒
-tick(96, flags=FLAG_ON, dt=5.0)
-chk('96°C 不重置计时', cpf._G.get('flag_ok_since') is not None,
+tick(91, flags=FLAG_ON, dt=5.0)
+chk('91°C 不重置计时', cpf._G.get('flag_ok_since') is not None,
     'since=%r' % cpf._G.get('flag_ok_since'))
 reset()
 tick(90, flags=FLAG_ON); tick(90, flags=FLAG_ON)
 for _ in range(6):
     tick(90, flags=FLAG_ON, dt=5.0)
-tick(98, flags=FLAG_ON, dt=5.0)
-chk('98°C 重置计时', cpf._G.get('flag_ok_since') is None)
-chk('98°C 时不判锁存', not cpf._G.get('trip_latched'))
+tick(93, flags=FLAG_ON, dt=5.0)
+chk('93°C 重置计时', cpf._G.get('flag_ok_since') is None)
+chk('93°C 时不判锁存', not cpf._G.get('trip_latched'))
 
 print('=== 6. 标志清零: 连续两轮真读才解除锁存 ===')
 reset()
@@ -306,9 +381,13 @@ print('=== 12. 实机 config.json 的关键取值 ===')
 try:
     real = json.load(open(os.path.join(ROOT, 'config.json'), encoding='utf-8'))
     rg = real.get('guard') or {}
-    chk('flag_release_c = 97', rg.get('flag_release_c') == 97.0, '= %r' % rg.get('flag_release_c'))
+    chk('flag_release_c = 92', rg.get('flag_release_c') == 92.0, '= %r' % rg.get('flag_release_c'))
     chk('flag_release_s = 60', rg.get('flag_release_s') == 60.0, '= %r' % rg.get('flag_release_s'))
-    chk('97 < crit_c', 97.0 < float(rg.get('crit_c') or 98.0), 'crit_c=%r' % rg.get('crit_c'))
+    chk('92 < crit_c', 92.0 < float(rg.get('crit_c') or 98.0), 'crit_c=%r' % rg.get('crit_c'))
+    chk('dts_now = 100', rg.get('dts_hot_now_c') == 100.0, '= %r' % rg.get('dts_hot_now_c'))
+    chk('crit_now = 99', rg.get('crit_now_c') == 99.0, '= %r' % rg.get('crit_now_c'))
+    chk('crit_floor = 100', rg.get('crit_floor_c') == 100.0, '= %r' % rg.get('crit_floor_c'))
+    chk('dts_crit = 99', rg.get('dts_crit_c') == 99.0, '= %r' % rg.get('dts_crit_c'))
     chk('pl1_w = 28 / pl2_w = 55',
         (real.get('pl1_w'), real.get('pl2_w')) == (28.0, 55.0),
         '%r' % ((real.get('pl1_w'), real.get('pl2_w')),))
